@@ -47,6 +47,16 @@ function hd_speed_async_css_handles() {
 		'wpcf7-redirect-script-frontend',
 		'wp-show-posts',
 		'wpshowposts',
+		'elementor-gf-local-roboto',
+		'elementor-gf-local-robotoslab',
+		'elementor-gf-local-montserrat',
+		'widget-nested-accordion',
+		'widget-divider',
+		'widget-icon-box',
+		'widget-social-icons',
+		'e-apple-webkit',
+		'elementor-icons-fa-regular',
+		'elementor-icons-fa-brands',
 	);
 }
 
@@ -115,6 +125,27 @@ add_filter( 'style_loader_tag', function ( $tag, $handle ) {
 	$async = str_replace( "media='all'", "media='print' onload=\"this.media='all'\"", $tag );
 	return $async . '<noscript>' . $tag . '</noscript>';
 }, 20, 2 );
+
+/* Duplicate (older) icon/font CSS from Header Footer Elementor; Elementor core already loads newer copies. */
+add_filter( 'style_loader_tag', function ( $tag, $handle ) {
+	static $dupes = array( 'hfe-elementor-icons', 'hfe-icons-list', 'hfe-social-icons', 'hfe-social-share-icons-brands', 'hfe-social-share-icons-fontawesome', 'hfe-nav-menu-icons' );
+	return ( hd_speed_active() && in_array( $handle, $dupes, true ) ) ? '' : $tag;
+}, 10, 2 );
+
+/* Icon fonts: font-display swap instead of block (same files, just redeclared). */
+add_action( 'wp_head', function () {
+	if ( ! hd_speed_active() ) {
+		return;
+	}
+	$b = content_url( '/plugins/elementor/assets/lib' );
+	echo '<style id="hd-font-swap">'
+		. '@font-face{font-family:"Font Awesome 5 Free";font-style:normal;font-weight:900;font-display:swap;src:url(' . $b . '/font-awesome/webfonts/fa-solid-900.woff2) format("woff2")}'
+		. '@font-face{font-family:"Font Awesome 5 Free";font-style:normal;font-weight:400;font-display:swap;src:url(' . $b . '/font-awesome/webfonts/fa-regular-400.woff2) format("woff2")}'
+		. '@font-face{font-family:"Font Awesome 5 Brands";font-style:normal;font-weight:400;font-display:swap;src:url(' . $b . '/font-awesome/webfonts/fa-brands-400.woff2) format("woff2")}'
+		. '@font-face{font-family:eicons;font-display:swap;src:url(' . $b . '/eicons/fonts/eicons.woff2) format("woff2")}'
+		. '</style>' . "
+";
+}, 50 );
 
 /* Drop the emoji stylesheet. */
 add_action( 'wp_enqueue_scripts', function () {
