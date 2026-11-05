@@ -1,0 +1,80 @@
+label.wpb-sdk-tag,
+span.wpb-sdk-tag {
+	background: #ffba00;
+	color: #1d2327;
+	display: inline-block;
+	border-radius: 3px;
+	padding: 5px;
+	font-size: 11px;
+	line-height: 11px;
+	vertical-align: baseline;
+}
+
+label.wpb-sdk-tag.wpb-sdk-warn,
+span.wpb-sdk-tag.wpb-sdk-warn {
+	background: #ffba00;
+}
+
+label.wpb-sdk-tag.wpb-sdk-info,
+span.wpb-sdk-tag.wpb-sdk-info {
+	background: #00a0d2;
+}
+
+label.wpb-sdk-tag.wpb-sdk-success,
+span.wpb-sdk-tag.wpb-sdk-success {
+	background: #46b450;
+}
+
+label.wpb-sdk-tag.wpb-sdk-error,
+span.wpb-sdk-tag.wpb-sdk-error {
+	background: #dc3232;
+}
+
+.wpb-sdk-switch-label {
+	font-size: 20px;
+	line-height: 31px;
+	margin: 0 5px;
+}
+
+#wpb-sdk_log_book table {
+	font-family: Consolas, Monaco, monospace;
+	font-size: 12px;
+}
+
+#wpb-sdk_log_book table th {
+	color: #ccc;
+}
+
+#wpb-sdk_log_book table tr {
+	background: #232525;
+}
+
+#wpb-sdk_log_book table tr.alternate {
+	background: #2b2b2b;
+}
+
+#wpb-sdk_log_book table tr td.wpb-sdk-col--logger {
+	color: #5a7435;
+}
+
+#wpb-sdk_log_book table tr td.wpb-sdk-col--type {
+	color: #ffc861;
+}
+
+#wpb-sdk_log_book table tr td.wpb-sdk-col--function {
+	color: #a7b7b1;
+	font-weight: 700;
+}
+
+#wpb-sdk_log_book table tr td.wpb-sdk-col--message,
+#wpb-sdk_log_book table tr td.wpb-sdk-col--message a {
+	color: #9a73ac !important;
+}
+
+#wpb-sdk_log_book table tr td.wpb-sdk-col--file {
+	color: #d07922;
+}
+
+#wpb-sdk_log_book table tr td.wpb-sdk-col--timestamp {
+	color: #6596be;
+}

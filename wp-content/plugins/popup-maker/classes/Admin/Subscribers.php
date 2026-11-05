@@ -1,0 +1,183 @@
+<?php
+/**
+ * Class for Admin Subscribers
+ *
+ * @package   PopupMaker
+ * @copyright Copyright (c) 2024, Code Atlantic LLC
+ */
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+/**
+ * Class PUM_Admin_Subscribers
+ */
+class PUM_Admin_Subscribers {
+
+	/**
+	 *
+	 */
+	public static function init() {
+		add_action( 'admin_menu', [ __CLASS__, 'after_page_registration' ], 11 );
+		add_filter( 'set-screen-option', [ __CLASS__, 'set_option' ], 10, 3 );
+	}
+
+	/**
+	 * Render settings page with tabs.
+	 */
+	public static function page() {
+		$subscribers = PUM_DB_Subscribers::instance();
+
+		if ( ! $subscribers->is_name_scrub_complete() ) {
+			$subscribers->run_name_scrub_batch();
+
+			if ( ! $subscribers->is_name_scrub_complete() ) {
+				self::render_name_scrub_notice();
+				return;
+			}
+		}
+
+		self::list_table()->prepare_items(); ?>
+
+		<div class="wrap">
+			<h1><?php esc_html_e( 'Subscribers', 'popup-maker' ); ?></h1>
+			<div id="pum-subscribers">
+				<div id="pum-subscribers-post-body">
+					<form id="pum-subscribers-list-form" method="get">
+						<?php
+						// phpcs:disable WordPress.Security.NonceVerification.Recommended
+						$page      = isset( $_REQUEST['page'] ) ? sanitize_key( wp_unslash( $_REQUEST['page'] ) ) : '';
+						$post_type = isset( $_REQUEST['post_type'] ) ? sanitize_key( wp_unslash( $_REQUEST['post_type'] ) ) : '';
+						// phpcs:enable WordPress.Security.NonceVerification.Recommended
+						?>
+						<input type = 'hidden' name = 'page' value = "<?php echo esc_attr( $page ); ?>" />
+						<input type = 'hidden' name = 'post_type' value = "<?php echo esc_attr( $post_type ); ?>" />
+						<?php
+						self::list_table()->search_box( __( 'Find', 'popup-maker' ), 'pum-subscriber-find' );
+						self::list_table()->display();
+						?>
+					</form>
+				</div>
+			</div>
+		</div>
+
+		<?php
+	}
+
+	/**
+	 * Render a blocking notice while stored subscriber names are sanitized.
+	 */
+	private static function render_name_scrub_notice() {
+		$refresh_url = admin_url( 'edit.php?page=pum-subscribers&post_type=popup' );
+		$nonce       = wp_create_nonce( 'pum_scrub_subscriber_names' );
+		?>
+		<div class="wrap">
+			<h1><?php esc_html_e( 'Subscribers', 'popup-maker' ); ?></h1>
+			<div class="notice notice-warning">
+				<p><strong><?php esc_html_e( 'Subscriber security cleanup in progress', 'popup-maker' ); ?></strong></p>
+				<p><?php esc_html_e( 'Subscriber records are temporarily hidden while stored names are sanitized. This page will refresh automatically when the cleanup is complete.', 'popup-maker' ); ?></p>
+				<p><a class="button button-primary" href="<?php echo esc_url( $refresh_url ); ?>"><?php esc_html_e( 'Refresh now', 'popup-maker' ); ?></a></p>
+			</div>
+		</div>
+		<script>
+			jQuery( function( $ ) {
+				function runBatch() {
+					$.post( window.ajaxurl, {
+						action: 'pum_scrub_subscriber_names',
+						nonce: '<?php echo esc_js( $nonce ); ?>'
+					} ).done( function( response ) {
+						if ( ! response.success ) {
+							return;
+						}
+
+						if ( response.data.complete ) {
+							window.location.reload();
+							return;
+						}
+
+						runBatch();
+					} );
+				}
+
+				runBatch();
+			} );
+		</script>
+		<?php
+	}
+
+	/**
+	 * Scrub one batch of stored subscriber names.
+	 */
+	public static function scrub_subscriber_names() {
+		check_ajax_referer( 'pum_scrub_subscriber_names', 'nonce' );
+
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( [], 403 );
+		}
+
+		$complete = PUM_DB_Subscribers::instance()->run_name_scrub_batch();
+
+		if ( null === $complete ) {
+			wp_send_json_error( [], 500 );
+		}
+
+		wp_send_json_success( [ 'complete' => $complete ] );
+	}
+
+	/**
+	 * @return PUM_Admin_Subscribers_Table
+	 */
+	public static function list_table() {
+		static $list_table;
+
+		if ( ! isset( $list_table ) ) {
+			$list_table = new PUM_Admin_Subscribers_Table();
+		}
+
+		return $list_table;
+	}
+
+	public static function after_page_registration() {
+		if ( empty( PUM_Admin_Pages::$pages['subscribers'] ) ) {
+			return;
+		}
+
+		add_action( 'load-' . PUM_Admin_Pages::$pages['subscribers'], [ 'PUM_Admin_Subscribers', 'load_user_list_table_screen_options' ] );
+	}
+
+	public static function load_user_list_table_screen_options() {
+		add_screen_option(
+			'per_page',
+			[
+				'label'   => __( 'Subscribers Per Page', 'popup-maker' ),
+				'default' => 20,
+				'option'  => 'pum_subscribers_per_page',
+			]
+		);
+
+		/*
+		 * Instantiate the User List Table. Creating an instance here will allow the core WP_List_Table class to automatically
+		 * load the table columns in the screen options panel
+		 */
+		self::list_table();
+	}
+
+	/**
+	 * Force WP to save the option.
+	 *
+	 * @param $status
+	 * @param $option
+	 * @param $value
+	 *
+	 * @return mixed
+	 */
+	public static function set_option( $status, $option, $value ) {
+
+		if ( 'pum_subscribers_per_page' === $option ) {
+			return $value;
+		}
+
+		return $status;
+	}
+}

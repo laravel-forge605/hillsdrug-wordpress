@@ -1,0 +1,3310 @@
+<?php
+
+namespace Simple_History;
+
+use Simple_History\Helpers;
+use Simple_History\Date_Helper;
+use Simple_History\Services;
+
+/**
+ * Queries the Simple History Log.
+ *
+ * @example Basic positive filtering (inclusion).
+ * ```php
+ * $log_query = new \Simple_History\Log_Query();
+ *
+ * // Get only info and warning level events
+ * $results = $log_query->query([
+ *     'posts_per_page' => 50,
+ *     'loglevels' => ['info', 'warning'],
+ * ]);
+ *
+ * // Search for events containing "updated"
+ * $results = $log_query->query([
+ *     'search' => 'updated',
+ * ]);
+ * ```
+ *
+ * @example Basic negative filtering (exclusion).
+ * ```php
+ * // Exclude debug level events
+ * $results = $log_query->query([
+ *     'exclude_loglevels' => ['debug'],
+ * ]);
+ *
+ * // Exclude events containing "cron"
+ * $results = $log_query->query([
+ *     'exclude_search' => 'cron',
+ * ]);
+ *
+ * // Exclude WP-Cron events
+ * $results = $log_query->query([
+ *     'exclude_initiator' => 'wp_cron',
+ * ]);
+ * ```
+ *
+ * @example Combining positive and negative filters.
+ * ```php
+ * // Get info events, but exclude those containing "cron"
+ * $results = $log_query->query([
+ *     'loglevels' => ['info'],
+ *     'exclude_search' => 'cron',
+ * ]);
+ *
+ * // Important events only (no debug, no cron jobs)
+ * $results = $log_query->query([
+ *     'exclude_loglevels' => ['debug'],
+ *     'exclude_initiator' => ['wp_cron', 'wp_cli'],
+ * ]);
+ * ```
+ *
+ * @example Conflict resolution: exclusion takes precedence.
+ * ```php
+ * // When same value in both filters, exclusion wins
+ * $results = $log_query->query([
+ *     'loggers' => ['SimplePluginLogger', 'SimpleUserLogger'],
+ *     'exclude_loggers' => ['SimpleUserLogger'],
+ * ]);
+ * // Result: Only SimplePluginLogger events
+ * ```
+ *
+ * @example Surrounding events (show events before and after a specific event).
+ * ```php
+ * // Get 5 events before and 5 events after event ID 123 (11 total).
+ * // This is useful for debugging to see what happened around a specific event.
+ * // Note: This bypasses logger permissions and shows raw chronological events.
+ * $results = $log_query->query([
+ *     'surrounding_event_id' => 123,
+ *     'surrounding_count' => 5,
+ * ]);
+ * // Result includes 'center_event_id' in the return array to identify the target event.
+ * ```
+ *
+ * @see Documentation: docs/filters-usage-examples.md
+ */
+class Log_Query {
+	/**
+	 * Columns that $args['orderby'] is allowed to sort by.
+	 *
+	 * Shared between prepare_args(), which falls back to 'date' for anything
+	 * not in this list, and query_overview(), which routes to the ungrouped
+	 * query for anything in this list except 'date'. Keeping both reads from
+	 * one constant means adding a sortable column can't update one and miss
+	 * the other.
+	 *
+	 * @var string[]
+	 */
+	const ORDERBY_COLUMNS = [ 'date', 'id', 'level', 'logger', 'message' ];
+
+	/**
+	 * Context keys that `metadata_search` must not look inside.
+	 *
+	 * `metadata_search` is a substring search over every context value, which
+	 * is the point of it — finding an event by an IP address or an email that
+	 * never appears in the message. That makes it a read of the context
+	 * table, not merely a filter on it: a reader who can ask "does any event
+	 * contain this phrase" and get a yes can recover the phrase itself, one
+	 * guess at a time.
+	 *
+	 * So anything the REST API deliberately declines to hand out whole has to
+	 * be excluded here too, or the withholding is decorative.
+	 *
+	 * `_annotation` is the case this was written for. The events controller
+	 * publishes a note's current text and a count of earlier versions, and
+	 * keeps the versions themselves back — every previous and deleted note
+	 * with its author and timestamp. Verified before the fix: an Editor, who
+	 * cannot write a note at all, found an event by text an administrator had
+	 * already replaced.
+	 *
+	 * @since 5.34.0
+	 * @var array<string>
+	 */
+	const METADATA_SEARCH_EXCLUDED_KEYS = [ '_annotation' ];
+
+	/**
+	 * Get the exact context keys the current user may not search or filter on.
+	 *
+	 * The keys in METADATA_SEARCH_EXCLUDED_KEYS for everyone, plus the keys
+	 * from Helpers::get_ip_address_context_keys() for users who can't see them
+	 * in the REST response, for the reason given above.
+	 *
+	 * IP address keys are matched by prefix rather than listed here, see
+	 * get_unsearchable_context_key_prefixes().
+	 *
+	 * @return array<string>
+	 */
+	private static function get_unsearchable_context_keys() {
+		$keys = self::METADATA_SEARCH_EXCLUDED_KEYS;
+
+		if ( ! Helpers::current_user_can_view_ip_addresses() ) {
+			$keys = array_merge( $keys, Helpers::get_ip_address_context_keys() );
+		}
+
+		return $keys;
+	}
+
+	/**
+	 * Get the context key prefixes the current user may not search or filter on.
+	 *
+	 * The IP address keys, for users without the view IP address capability.
+	 * The REST API withholds them from those users, so searching them would
+	 * hand the addresses out one guess at a time.
+	 *
+	 * @return array<string>
+	 */
+	private static function get_unsearchable_context_key_prefixes() {
+		if ( Helpers::current_user_can_view_ip_addresses() ) {
+			return [];
+		}
+
+		return Helpers::get_ip_address_context_key_prefixes();
+	}
+
+	/**
+	 * Send a database error to the error log rather than to the client.
+	 *
+	 * Every caller of this class that can fail is reachable over REST by
+	 * anyone holding the view-history capability, which defaults to
+	 * `edit_pages`. `$wpdb->last_error` carries table prefixes, column names
+	 * and pieces of the statement, none of which that reader can act on and
+	 * all of which describes the schema to someone who should not have it.
+	 *
+	 * @since 5.34.0
+	 * @param string $error The database error.
+	 */
+	private static function log_db_error( $error ) {
+		if ( ! defined( 'WP_DEBUG' ) || ! WP_DEBUG ) {
+			return;
+		}
+
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		error_log( 'Simple History: database query failed: ' . $error );
+	}
+
+	/**
+	 * Query the log.
+	 *
+	 * @param string|array|object $args {
+	 *    Optional. Array or string of arguments for querying the log.
+	 *
+	 *    Pagination and Result Type.
+	 *
+	 *      @type string $type Type of query. Accepts 'overview', 'occasions', or 'single'. Default 'overview'.
+	 *      @type int $posts_per_page Number of posts to show per page. Default is 10.
+	 *      @type int $paged Page to show. 1 = first page. Default 1.
+	 *      @type array $post__in Array. Only get posts that are in array. Default null.
+	 *      @type int $max_id_first_page If max_id_first_page is set then only get rows that have id equal or lower than this, to make
+	 *                                      sure that the first page of results is not too large. Default null.
+	 *      @type int $since_id If since_id is set the rows returned will only be rows with an ID greater than (i.e. more recent than) since_id. Default null.
+	 *
+	 *    Date Filters.
+	 *
+	 *      @type int|string $date_from From date, as unix timestamp integer or as a format compatible with strtotime, for example 'Y-m-d H:i:s'. Default null.
+	 *      @type int|string $date_to To date, as unix timestamp integer or as a format compatible with strtotime, for example 'Y-m-d H:i:s'. Default null.
+	 *      @type array|string $months Months in format "Y-m". Default null.
+	 *      @type array|string $dates Dates in format "month:2015-06" for june 2015 or "lastdays:7" for the last 7 days. Default null.
+	 *
+	 *    Inclusion Filters (what to show).
+	 *
+	 *      @type string $search Text to search for. Message, logger and level are searched for in main table. Values are searched for in context table. Default null.
+	 *      @type string|array $loglevels Log levels to include. Comma separated string or array. Defaults to all. Default null.
+	 *      @type string|array $loggers Loggers to include. Comma separated string or array. Default null = all the user can read.
+	 *      @type string|array $messages Messages to include. Array or string with comma separated in format "LoggerSlug:Message", e.g. "SimplePluginLogger:plugin_activated,SimplePluginLogger:plugin_deactivated". Default null = show all messages.
+	 *      @type int $user Single user ID as number. Default null.
+	 *      @type string|array $users User IDs, comma separated string or array. Default null.
+	 *      @type string|array $initiator Initiator to filter by. Single string or array of initiators. Default null.
+	 *      @type string $ip_address IP address to filter by. Supports anonymized IPs with ".x" suffix. Default null.
+	 *
+	 *    Exclusion Filters (what to hide).
+	 *      When both inclusion and exclusion filters are specified for the same field, exclusion takes precedence.
+	 *
+	 *      @type string $exclude_search Text to exclude. Events containing these words will be hidden. Default null.
+	 *      @type string|array $exclude_loglevels Log levels to exclude. Comma separated string or array. Default null.
+	 *      @type string|array $exclude_loggers Loggers to exclude. Comma separated string or array. Default null.
+	 *      @type string|array $exclude_messages Messages to exclude. Array or string with comma separated in format "LoggerSlug:Message". Default null.
+	 *      @type int $exclude_user Single user ID to exclude. Default null.
+	 *      @type string|array $exclude_users User IDs to exclude, comma separated string or array. Default null.
+	 *      @type string|array $exclude_initiator Initiator(s) to exclude. Single string or array of initiators. Default null.
+	 *
+	 *    Other Options.
+	 *
+	 *      @type boolean $include_sticky Include sticky events in the result set. Default false.
+	 *      @type boolean $only_sticky Only return sticky events. Default false.
+	 *      @type array $context_filters Context filters as key-value pairs. Default null.
+	 *      @type boolean $ungrouped Return ungrouped events without occasions grouping. Default false.
+	 *      @type string $orderby Column to sort by. One of 'date', 'id', 'level', 'logger', 'message'. Anything else falls back to 'date'. Setting this to anything but 'date' forces $ungrouped to true, because occasion grouping depends on rows arriving in date order. Default 'date'.
+	 *      @type string $order Sort direction, 'ASC' or 'DESC', case-insensitive. Anything else falls back to 'DESC'. 'ASC' forces $ungrouped to true for the same reason a non-date $orderby does: the grouped statement can only return newest first. Default 'DESC'.
+	 *
+	 *    Surrounding Events (Admin Only - bypasses logger permissions).
+	 *
+	 *      @type int $surrounding_event_id The center event ID to get surrounding events for. When set, returns events
+	 *                                       chronologically before and after this event, ignoring all other filters.
+	 *      @type int $surrounding_count Number of events to return before AND after the center event. Default 5.
+	 *                                    Total events returned = surrounding_count * 2 + 1 (before + center + after).
+	 * }
+	 * @return array|\WP_Error Query results or WP_Error on database error.
+	 * @throws \InvalidArgumentException If invalid query type.
+	 */
+	public function query( $args = [] ) {
+		$args = wp_parse_args( $args );
+
+		// Check for surrounding events query (special mode that bypasses normal filtering).
+		if ( isset( $args['surrounding_event_id'] ) ) {
+			return $this->query_surrounding_events( $args );
+		}
+
+		// Determine kind of query.
+		$type = $args['type'] ?? 'overview';
+		if ( $type === 'overview' || $type === 'single' ) {
+			$result = $this->query_overview( $args );
+		} elseif ( $type === 'occasions' ) {
+			$result = $this->query_occasions( $args );
+		} else {
+			throw new \InvalidArgumentException( 'Invalid query type' );
+		}
+
+		// Auto-recover from missing tables.
+		if ( is_wp_error( $result ) ) {
+			$db_error = $result->get_error_data( 'simple_history_db_error' )['db_error'] ?? '';
+
+			if ( Services\Setup_Database::is_table_missing_error( $db_error ) ) {
+				// Try to recreate tables.
+				$recreated = Services\Setup_Database::recreate_tables_if_missing();
+
+				if ( $recreated ) {
+					// Retry the query after recreating tables.
+					if ( $type === 'overview' || $type === 'single' ) {
+						$result = $this->query_overview( $args );
+					} elseif ( $type === 'occasions' ) {
+						$result = $this->query_occasions( $args );
+					}
+				}
+			}
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Query history using a query that uses full group by,
+	 * making it compatible with both MySQL 5.5, 5.7 and MariaDB.
+	 *
+	 * Subsequent occasions query thanks to the answer Stack Overflow thread:
+	 * http://stackoverflow.com/questions/13566303/how-to-group-subsequent-rows-based-on-a-criteria-and-then-count-them-mysql/13567320#13567320
+	 *
+	 * @param string|array|object $args Arguments.
+	 * @return array|\WP_Error Log rows or WP_Error on database error.
+	 * @throws \ErrorException If invalid DB engine.
+	 */
+	public function query_overview( $args ) {
+		// Force simple query for ungrouped results.
+		//
+		// Sorting by anything other than date also forces the simple query,
+		// because occasion grouping depends on rows arriving in date order.
+		// prepare_args() normalises this too, but that runs inside
+		// query_overview_simple()/query_overview_mysql(), which is too late
+		// to decide which of the two gets called — so the same check is
+		// done again here, against the raw arg, reading from the same
+		// self::ORDERBY_COLUMNS list prepare_args() uses so the two can't
+		// drift apart.
+		$sorts_by_non_date_column = isset( $args['orderby'] )
+			&& in_array( $args['orderby'], self::ORDERBY_COLUMNS, true )
+			&& $args['orderby'] !== 'date';
+
+		// Ascending order forces it too. The grouped statement hardcodes
+		// `ORDER BY date DESC, id DESC` in both its inner and outer query, so
+		// it can only ever return newest first — asking it for oldest first
+		// used to return newest first with no error, which is worse than not
+		// supporting it.
+		$sorts_ascending = isset( $args['order'] )
+			&& strtoupper( (string) $args['order'] ) === 'ASC';
+
+		if ( ! empty( $args['ungrouped'] ) || $sorts_by_non_date_column || $sorts_ascending ) {
+			return $this->query_overview_simple( $args );
+		}
+
+		// Skip occasion grouping when searching — individual results are more
+		// useful and the grouped query is orders of magnitude slower because
+		// the session-variable inner query must scan all matching rows sequentially.
+		$has_search = ! empty( $args['search'] ) || ! empty( $args['metadata_search'] );
+		if ( $has_search ) {
+			return $this->query_overview_simple( $args );
+		}
+
+		$db_engine = $this->get_db_engine();
+
+		if ( $db_engine === 'mysql' ) {
+			// Call usual method.
+			return $this->query_overview_mysql( $args );
+		}
+
+		if ( $db_engine === 'sqlite' ) {
+			// Call sqlite method.
+			return $this->query_overview_simple( $args );
+		}
+
+		throw new \ErrorException( 'Invalid DB engine' );
+	}
+
+	/**
+	 * Simplified version of query_overview_mysql() that returns ungrouped events.
+	 * This query does not group events by occasions, returning each event individually.
+	 * Originally created for SQLite compatibility but useful for any ungrouped display.
+	 *
+	 * @param string|array|object $args Arguments.
+	 * @return array|\WP_Error Log rows or WP_Error on database error.
+	 * @throws \Exception If error when performing query.
+	 */
+	protected function query_overview_simple( $args ) {
+		$args = $this->prepare_args( $args );
+
+		// Create cache key based on args and current user.
+		// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+		$cache_key   = md5( __METHOD__ . serialize( $args ) ) . '_userid_' . get_current_user_id();
+		$cache_group = Helpers::get_cache_group();
+
+		/** @var array|false Return value. */
+		$arr_return = wp_cache_get( $cache_key, $cache_group );
+
+		// Return cached value if it exists.
+		if ( $arr_return !== false ) {
+			$arr_return['cached_result'] = true;
+			return $arr_return;
+		}
+
+		global $wpdb;
+
+		$Simple_History = Simple_History::get_instance();
+
+		/**
+		 * @var string SQL template used to get all events from the ones
+		 *             found in statement sql_statement_max_ids_and_count_template.
+		 *             This final statement gets all columns we finally need.
+		 */
+		$sql_statement_log_rows = '
+			SELECT
+				simple_history_1.id,
+				simple_history_1.logger,
+				simple_history_1.level,
+				simple_history_1.date,
+				simple_history_1.message,
+				simple_history_1.initiator,
+				simple_history_1.occasionsID,
+				1 AS repeatCount,
+				1 AS subsequentOccasions
+			FROM %1$s AS simple_history_1
+			%2$s
+			%4$s
+			%3$s
+		';
+
+		$inner_where_array  = $this->get_inner_where( $args );
+		$inner_where_string = empty( $inner_where_array ) ? '' : "\nWHERE " . implode( "\nAND ", $inner_where_array );
+
+		/** @var int $limit_offset */
+		$limit_offset = ( $args['paged'] - 1 ) * $args['posts_per_page'];
+
+		/** @var string Limit clause. */
+		$limit_clause = sprintf( 'LIMIT %1$d, %2$d', $limit_offset, $args['posts_per_page'] );
+
+		$sql_query_log_rows = sprintf(
+			$sql_statement_log_rows,
+			$Simple_History->get_events_table_name(), // 1
+			$inner_where_string, // 2
+			$limit_clause, // 3
+			$this->get_order_by_clause( $args, 'simple_history_1' ) // 4
+		);
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.PreparedSQL.NotPrepared
+		$result_log_rows = $wpdb->get_results( $sql_query_log_rows, OBJECT_K );
+
+		if ( ! empty( $wpdb->last_error ) ) {
+			// Not in the error data either: rest_convert_error_to_response()
+			// hands WP_Error data back to the client, so `db_error` here was
+			// the same disclosure as putting it in the message.
+			self::log_db_error( $wpdb->last_error );
+
+			return new \WP_Error(
+				'simple_history_db_error',
+				__( 'Database query failed.', 'simple-history' )
+			);
+		}
+
+		// Append context to log rows.
+		$result_log_rows = $this->add_contexts_to_log_rows( $result_log_rows );
+
+		// Re-index array.
+		$result_log_rows = array_values( $result_log_rows );
+
+		$total_found_rows = null;
+		$pages_count      = null;
+		$log_rows_count   = count( $result_log_rows );
+		$page_rows_from   = ( $args['paged'] * $args['posts_per_page'] ) - $args['posts_per_page'] + 1;
+		$page_rows_to     = $page_rows_from + $log_rows_count - 1;
+
+		if ( ! $args['skip_count_query'] ) {
+			// Like $sql_statement_log_rows but all columns is replaced by a single COUNT(*).
+			$sql_statement_log_rows_count = '
+				SELECT count(*) as count
+				FROM %1$s AS simple_history_1
+				%2$s
+			';
+
+			$sql_query_log_rows_count = sprintf(
+				$sql_statement_log_rows_count,
+				$Simple_History->get_events_table_name(), // 1
+				$inner_where_string, // 2
+			);
+
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$total_found_rows = $wpdb->get_var( $sql_query_log_rows_count );
+
+			// Calc pages.
+			$pages_count = Ceil( $total_found_rows / $args['posts_per_page'] );
+		}
+
+		// Get maxId, minId, and maxDate.
+		// MaxId is the highest id among the returned rows.
+		// MinId is the lowest id among the returned rows.
+		// MaxDate is the latest date among the returned rows.
+		// These are derived from the actual values rather than read
+		// positionally, because "first row" and "last row" only mean "newest"
+		// and "oldest" for the default date-DESC order. With orderby/order set
+		// to anything else the first row can be any row, and reading it
+		// positionally made max_id the oldest id under
+		// `orderby=id&order=asc`, which broke the new-events notifier (it
+		// treated the whole log as new).
+		//
+		// max_date is the highest DATE, not the date of the row holding
+		// max_id. Those are the same thing only while dates rise with ids,
+		// and they do not have to: a logger can set its own `date` through
+		// the `_date` context, which importers and backfills use. A page
+		// holding A(id 100, 10:00) and B(id 101, 08:00) would otherwise
+		// report max_id 101 with max_date 08:00, and the has-updates check —
+		// `date > since_date OR (date = since_date AND id > since_id)` —
+		// would then match A on every poll forever: a "1 new event" badge
+		// that never clears.
+		$min_id   = null;
+		$max_id   = null;
+		$max_date = null;
+
+		if ( sizeof( $result_log_rows ) > 0 ) {
+			$row_ids = wp_list_pluck( $result_log_rows, 'id' );
+			$max_id  = max( $row_ids );
+			$min_id  = min( $row_ids );
+
+			$row_dates = array_filter( wp_list_pluck( $result_log_rows, 'date' ) );
+
+			if ( $row_dates !== [] ) {
+				// String comparison is the right one here: these are MySQL
+				// DATETIME strings, which sort lexicographically.
+				$max_date = max( $row_dates );
+			}
+		}
+
+		// Create array to return.
+		// Add log rows to sub key 'log_rows' because meta info is also added.
+		$arr_return = [
+			'total_row_count' => $total_found_rows !== null ? (int) $total_found_rows : null,
+			'pages_count'     => $pages_count,
+			'page_current'    => $args['paged'],
+			'page_rows_from'  => $page_rows_from,
+			'page_rows_to'    => $page_rows_to,
+			'max_id'          => (int) $max_id,
+			'min_id'          => (int) $min_id,
+			'max_date'        => $max_date,
+			'log_rows_count'  => $log_rows_count,
+			'log_rows'        => $result_log_rows,
+		];
+
+		wp_cache_set( $cache_key, $arr_return, $cache_group );
+
+		return $arr_return;
+	}
+
+	/**
+	 * @param string|array|object $args Arguments.
+	 * @return array|\WP_Error Log rows or WP_Error on database error.
+	 * @throws \Exception If error when performing query.
+	 */
+	protected function query_overview_mysql( $args ) {
+		// Parse and prepare args.
+		$args = $this->prepare_args( $args );
+
+		// Create cache key based on args and current user.
+		// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+		$cache_key   = md5( __METHOD__ . serialize( $args ) ) . '_userid_' . get_current_user_id();
+		$cache_group = Helpers::get_cache_group();
+
+		/** @var array|false Return value. */
+		$arr_return = wp_cache_get( $cache_key, $cache_group );
+
+		// Return cached value if it exists.
+		if ( $arr_return !== false ) {
+			$arr_return['cached_result'] = true;
+			return $arr_return;
+		}
+
+		global $wpdb;
+
+		$Simple_History = Simple_History::get_instance();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->query( 'SET @a:=NULL, @counter:=1, @groupby:=0, SQL_BIG_SELECTS=1' );
+
+		/**
+		 *  @var string SQL statement that will be used for inner join.
+		 *
+		 * Template uses number argument to sprintf to insert values.
+		 * Arguments:
+		 * 1 = table name for events.
+		 * 2 = table name for contexts.
+		 * 2 = where clause.
+		 *
+		 * TODO: Add where for messages. Check that both logger and key are correct.
+		 */
+		$inner_sql_statement_template = '
+
+			## START INNER_SQL_QUERY_STATEMENT
+			SELECT
+				id,
+				#message,
+				IF(@a=occasionsID,@counter:=@counter+1,@counter:=1) AS repeatCount,
+				IF(@counter=1,@groupby:=@groupby+1,@groupby) AS repeated,
+				@a:=occasionsId,
+				contexts.value as context_message_key
+			FROM %1$s AS h2
+
+			# Join column with message key so its searchable/filterable.
+			LEFT OUTER JOIN %2$s AS contexts ON (contexts.history_id = h2.id AND contexts.key = \'_message_key\')
+
+			# Where statement.
+			%3$s
+
+			ORDER BY date DESC, id DESC
+			## END INNER_SQL_QUERY_STATEMENT
+
+		';
+
+		$inner_where_array  = $this->get_inner_where( $args );
+		$inner_where_string = empty( $inner_where_array ) ? '' : "\nWHERE " . implode( "\nAND ", $inner_where_array );
+
+		$inner_sql_query_statement = sprintf(
+			$inner_sql_statement_template,
+			$Simple_History->get_events_table_name(), // 1
+			$Simple_History->get_contexts_table_name(), // 2
+			$inner_where_string // 3
+		);
+
+		/**
+		 * @var string SQL statement template used to get IDs of all events.
+		 *
+		 * Template uses number argument to sprintf to insert values.
+		 * Arguments:
+		 * 1 = table name for events.
+		 * 2 = table name for contexts.
+		 * 3 = Inner join SQL query.
+		 * 4 = where clause for outer query.
+		 * 5 = limit clause.
+		 */
+		$sql_statement_max_ids_and_count_template = '
+
+			## START SQL_STATEMENT_MAX_IDS_AND_COUNT_TEMPLATE
+			SELECT 
+				max(h.id) as maxId,
+				min(h.id) as minId,
+				max(historyWithRepeated.repeatCount) as repeatCount,
+			max(h.date) as maxDate
+			FROM %1$s AS h
+
+			INNER JOIN (
+				%3$s
+			) as historyWithRepeated ON historyWithRepeated.id = h.id
+
+			# Outer where
+			%4$s
+			
+			GROUP BY historyWithRepeated.repeated
+			ORDER by maxDate DESC, maxId DESC
+
+			# Limit
+			%5$s
+
+			## END SQL_STATEMENT_MAX_IDS_AND_COUNT_TEMPLATE
+		';
+
+		/** @var string Outer where clause, including "where" if has values. */
+		$outer_where_string = '';
+
+		$outer_where_array = $this->get_outer_where( $args );
+		if ( ! empty( $outer_where_array ) ) {
+			$outer_where_string = "\nWHERE " . implode( "\nAND ", $outer_where_array );
+		}
+
+		/** @var int $limit_offset */
+		$limit_offset = ( $args['paged'] - 1 ) * $args['posts_per_page'];
+
+		/** @var string Limit clause. */
+		$limit_clause = sprintf( 'LIMIT %1$d, %2$d', $limit_offset, $args['posts_per_page'] );
+
+		$max_ids_and_count_sql_statement = sprintf(
+			$sql_statement_max_ids_and_count_template,
+			$Simple_History->get_events_table_name(), // 1
+			$Simple_History->get_contexts_table_name(), // 2
+			$inner_sql_query_statement, // 3
+			$outer_where_string, // 4
+			$limit_clause // 5 Limit clause.
+		);
+
+		/**
+		 * @var string SQL template used to get all events from the ones
+		 *             found in statement sql_statement_max_ids_and_count_template.
+		 *             This final statement gets all columns we finally need.
+		 */
+		$sql_statement_log_rows = '
+
+			## START SQL_STATEMENT_LOG_ROWS
+			SELECT
+				simple_history_1.id,
+				maxId,
+				minId,
+				simple_history_1.logger,
+				simple_history_1.level,
+				simple_history_1.date,
+				simple_history_1.message,
+				simple_history_1.initiator,
+				simple_history_1.occasionsID,
+				repeatCount,
+				repeatCount AS subsequentOccasions
+
+			FROM %1$s AS simple_history_1
+
+			INNER JOIN (
+				%2$s
+			) AS max_ids_and_count ON simple_history_1.id = max_ids_and_count.maxId
+
+			ORDER BY simple_history_1.date DESC, simple_history_1.id DESC
+			## END SQL_STATEMENT_LOG_ROWS
+
+		';
+
+		$sql_query_log_rows = sprintf(
+			$sql_statement_log_rows,
+			$Simple_History->get_events_table_name(), // 1
+			$max_ids_and_count_sql_statement // 2
+		);
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+		$result_log_rows = $wpdb->get_results( $sql_query_log_rows, OBJECT_K );
+
+		if ( ! empty( $wpdb->last_error ) ) {
+			// Not in the error data either: rest_convert_error_to_response()
+			// hands WP_Error data back to the client, so `db_error` here was
+			// the same disclosure as putting it in the message.
+			self::log_db_error( $wpdb->last_error );
+
+			return new \WP_Error(
+				'simple_history_db_error',
+				__( 'Database query failed.', 'simple-history' )
+			);
+		}
+
+		// Append context to log rows.
+		$result_log_rows = $this->add_contexts_to_log_rows( $result_log_rows );
+
+		// Re-index array.
+		$result_log_rows = array_values( $result_log_rows );
+
+		// Get max id, min id, and max date.
+		// Max id is the id of the first row in the result (i.e. the latest entry).
+		// Min id is the minId value of the last row in the result (i.e. the oldest entry).
+		// Max date is the date of the first row (for accurate new event detection with date ordering).
+		$min_id   = null;
+		$max_id   = null;
+		$max_date = null;
+		if ( sizeof( $result_log_rows ) > 0 ) {
+			$max_id   = $result_log_rows[0]->id;
+			$min_id   = $result_log_rows[ count( $result_log_rows ) - 1 ]->minId;
+			$max_date = $result_log_rows[0]->date;
+		}
+
+		$total_found_rows = null;
+		$pages_count      = null;
+		$log_rows_count   = count( $result_log_rows );
+		$page_rows_from   = ( $args['paged'] * $args['posts_per_page'] ) - $args['posts_per_page'] + 1;
+		$page_rows_to     = $page_rows_from + $log_rows_count - 1;
+
+		if ( ! $args['skip_count_query'] ) {
+			// Like $sql_statement_log_rows but all columns is replaced by a single COUNT(*).
+			$sql_statement_log_rows_count = '
+				## START SQL_STATEMENT_LOG_ROWS
+				SELECT
+					count(*) as count
+
+				FROM %1$s AS simple_history_1
+
+				INNER JOIN (
+					%2$s
+				) AS max_ids_and_count ON simple_history_1.id = max_ids_and_count.maxId
+
+				ORDER BY simple_history_1.date DESC, simple_history_1.id DESC
+				## END SQL_STATEMENT_LOG_ROWS
+			';
+
+			// Create $max_ids_and_count_sql_statement without limit,
+			// to get count(*).
+			$max_ids_and_count_without_limit_sql_statement = sprintf(
+				$sql_statement_max_ids_and_count_template,
+				$Simple_History->get_events_table_name(), // 1
+				$Simple_History->get_contexts_table_name(), // 2
+				$inner_sql_query_statement, // 3
+				$outer_where_string, // 4
+				'', // 5 Limit clause.
+			);
+
+			$sql_query_log_rows_count = sprintf(
+				$sql_statement_log_rows_count,
+				$Simple_History->get_events_table_name(), // 1
+				$max_ids_and_count_without_limit_sql_statement // 2
+			);
+
+			// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+			$total_found_rows = $wpdb->get_var( $sql_query_log_rows_count );
+
+			// Calc pages.
+			$pages_count = Ceil( $total_found_rows / $args['posts_per_page'] );
+		}
+
+		// Prepend sticky events to the result.
+		// Sticky events are added first in the result set and does not
+		// count towards the total found rows or modify pagination, etc.
+		if ( $args['include_sticky'] ) {
+			$sticky_events = $this->get_sticky_events();
+
+			if ( ! empty( $sticky_events ) ) {
+				$query_sticky_events = $this->query(
+					[
+						'post__in'  => $sticky_events,
+						'ungrouped' => true,
+					]
+				);
+
+				$sticky_log_rows = $query_sticky_events['log_rows'];
+
+				// Append sticky_appended=true to each event,
+				// so we on client side can differentiate between sticky events and other events.
+				$sticky_log_rows = array_map(
+					function ( $log_row ) {
+						$log_row->sticky_appended = true;
+
+						return $log_row;
+					},
+					$sticky_log_rows
+				);
+
+				// Prepend sticky events to the result, at the top.
+				$result_log_rows = array_merge( $sticky_log_rows, $result_log_rows );
+			}
+		}
+
+		// Create array to return.
+		// Add log rows to sub key 'log_rows' because meta info is also added.
+		$arr_return = [
+			'total_row_count' => $total_found_rows !== null ? (int) $total_found_rows : null,
+			'pages_count'     => $pages_count,
+			'page_current'    => $args['paged'],
+			'page_rows_from'  => $page_rows_from,
+			'page_rows_to'    => $page_rows_to,
+			'max_id'          => (int) $max_id,
+			'min_id'          => (int) $min_id,
+			'max_date'        => $max_date,
+			'log_rows_count'  => $log_rows_count,
+			// Remove id from keys, because they are cumbersome when working with JSON.
+			'log_rows'        => $result_log_rows,
+		];
+
+		wp_cache_set( $cache_key, $arr_return, $cache_group );
+
+		return $arr_return;
+	}
+
+	/**
+	 * Get occasions for a single event.
+	 *
+	 * Required args are:
+	 * - occasionsID: The id to get occasions for.
+	 * - occasionsCount: The number of occasions to get.
+	 * - occasionsCountMaxReturn: The max number of occasions to return.
+	 *
+	 * Does not take filters/where into consideration.
+	 *
+	 * @param string|array|object $args Arguments.
+	 * @return array|\WP_Error Log rows or WP_Error on database error.
+	 */
+	protected function query_occasions( $args ) {
+		// Create cache key based on args and current user.
+		// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+		$cache_key   = 'SimpleHistoryLogQuery_' . md5( serialize( $args ) ) . '_userid_' . get_current_user_id();
+		$cache_group = Helpers::get_cache_group();
+
+		/** @var array Return value. */
+		$arr_return = wp_cache_get( $cache_key, $cache_group );
+
+		// Return cached value if it exists.
+		if ( $arr_return !== false ) {
+			$arr_return['cached_result'] = true;
+			return $arr_return;
+		}
+
+		$simpe_history       = Simple_History::get_instance();
+		$events_table_name   = $simpe_history->get_events_table_name();
+		$contexts_table_name = $simpe_history->get_contexts_table_name();
+
+		$args = wp_parse_args(
+			$args,
+			[
+				'type'                    => 'occasions',
+				'logRowID'                => null,
+				'occasionsID'             => null,
+				'occasionsCount'          => null,
+				'occasionsCountMaxReturn' => null,
+			]
+		);
+
+		$args = $this->prepare_args( $args );
+
+		// Get occasions for a single event.
+		// Args must contain:
+		// - occasionsID: The id to get occasions for
+		// - occasionsCount: The number of occasions to get.
+		// - occasionsCountMaxReturn: The max number of occasions to return,
+		// if occasionsCount is very large and we do not want to get all occasions.
+
+		/**
+		 * @var string $sql_statement_template SQL template for occasions query.
+		 * Template uses number argument to sprintf to insert values.
+		 * Arguments:
+		 * 1 = where clause.
+		 * 2 = limit clause.
+		 * 3 = table name for events.
+		 *
+		 * subsequentOccasions is hard coded because the column exists in the
+		 * overview query. The join adds the context message key.
+		 *
+		 * No "#" comments inside the SQL: this query also runs on SQLite, and
+		 * the SQLite driver fails on them, so no occasions were returned there.
+		 */
+		$sql_statement_template = '
+			SELECT 
+				h.id,
+				h.logger,
+				h.level,
+				h.date,
+				h.message,
+				h.initiator,
+				h.occasionsID,
+				c1.value AS context_message_key,
+				1 as subsequentOccasions
+			FROM %3$s AS h
+			LEFT OUTER JOIN %4$s AS c1 ON (c1.history_id = h.id AND c1.key = "_message_key")
+			%1$s
+			
+			ORDER BY date DESC, id DESC
+			%2$s
+		';
+
+		global $wpdb;
+
+		/** @var array Where clauses for outer query. */
+		$outer_where = [];
+
+		// Only include loggers that the current user can view, same as get_inner_where().
+		// Occasion IDs are predictable, so without this a user could read events
+		// from loggers they have no access to by guessing an occasion ID.
+		if ( empty( $args['ignore_logger_capabilities'] ) ) {
+			$sql_loggers_user_can_view = $simpe_history->get_loggers_that_user_can_read( get_current_user_id(), 'sql' );
+			$outer_where[]             = "h.logger IN {$sql_loggers_user_can_view}";
+		}
+
+		// Get rows with id lower than logRowID, i.e. previous rows.
+		$outer_where[] = 'h.id < ' . (int) $args['logRowID'];
+
+		// Get rows with occasionsID equal to occasionsID.
+		$outer_where[] = $wpdb->prepare( 'h.occasionsID = %s', (string) $args['occasionsID'] );
+
+		// Clamp the number of occasions to a sane range.
+		// A missing or negative value would otherwise give invalid SQL.
+		$occasions_count = max( 0, min( 1000, (int) $args['occasionsCount'] ) );
+
+		if ( isset( $args['occasionsCountMaxReturn'] ) && $args['occasionsCountMaxReturn'] < $occasions_count ) {
+			// Limit to max nn events if occasionsCountMaxReturn is set.
+			// Used for example in GUI to prevent to many events returned, that can stall the browser.
+			$limit = 'LIMIT ' . max( 0, (int) $args['occasionsCountMaxReturn'] );
+		} else {
+			// Regular limit that gets all occasions.
+			$limit = 'LIMIT ' . $occasions_count;
+		}
+
+		// Create where string.
+		$outer_where = implode( "\nAND ", $outer_where );
+
+		// Append where to sql template.
+		if ( ! empty( $outer_where ) ) {
+			$outer_where = "\nWHERE {$outer_where}";
+		}
+
+		/** @var string SQL generated from template. */
+		$sql_query = sprintf(
+			$sql_statement_template, // sprintf template.
+			$outer_where,  // 1
+			$limit, // 2
+			$events_table_name, // 3
+			$contexts_table_name // 4
+		);
+
+		/** @var array<string,object> Log rows matching where queries. */
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+		$log_rows = $wpdb->get_results( $sql_query, OBJECT_K );
+
+		$log_rows = $this->add_contexts_to_log_rows( $log_rows );
+
+		return [
+			// Remove id from keys, because they are cumbersome when working with JSON.
+			'log_rows' => array_values( $log_rows ),
+			'sql'      => $sql_query,
+		];
+	}
+
+	/**
+	 * Query for surrounding events around a specific event ID.
+	 *
+	 * This method returns events before and after a specific event in reverse
+	 * chronological order (newest first), matching the main event log display.
+	 * It bypasses logger, user, and other filters for debugging scenarios.
+	 *
+	 * IMPORTANT: This method bypasses normal logger permission checks and returns
+	 * ALL events. Permission checking should be done by the caller (REST API or
+	 * WP-CLI) before calling this method.
+	 *
+	 * @param array $args {
+	 *     Query arguments.
+	 *
+	 *     @type int $surrounding_event_id Required. The center event ID.
+	 *     @type int $surrounding_count    Optional. Number of events before AND after. Default 5.
+	 * }
+	 * @return array|\WP_Error {
+	 *     Query results array or WP_Error on failure.
+	 *
+	 *     @type array  $log_rows         Array of event objects (after + center + before, newest first).
+	 *     @type int    $center_event_id  The ID of the center event.
+	 *     @type int    $total_row_count  Total number of events returned.
+	 *     @type int    $events_before    Count of events before center.
+	 *     @type int    $events_after     Count of events after center.
+	 *     @type int    $max_id           Highest event ID in results.
+	 *     @type int    $min_id           Lowest event ID in results.
+	 *     @type string $max_date         Date of most recent event.
+	 * }
+	 */
+	protected function query_surrounding_events( $args ) {
+		global $wpdb;
+
+		$simple_history    = Simple_History::get_instance();
+		$events_table_name = $simple_history->get_events_table_name();
+
+		// Parse arguments with defaults.
+		$args = wp_parse_args(
+			$args,
+			[
+				'surrounding_event_id' => null,
+				'surrounding_count'    => 5,
+			]
+		);
+
+		// Validate surrounding_event_id.
+		if ( ! isset( $args['surrounding_event_id'] ) || ! is_numeric( $args['surrounding_event_id'] ) ) {
+			return new \WP_Error(
+				'invalid_surrounding_event_id',
+				__( 'Invalid surrounding_event_id parameter.', 'simple-history' ),
+				[ 'status' => 400 ]
+			);
+		}
+
+		$center_event_id = (int) $args['surrounding_event_id'];
+
+		// Validate surrounding_count (must be positive integer, max 50).
+		$surrounding_count = (int) $args['surrounding_count'];
+		if ( $surrounding_count < 1 ) {
+			$surrounding_count = 5;
+		}
+		if ( $surrounding_count > 50 ) {
+			$surrounding_count = 50;
+		}
+
+		// First, verify the center event exists and get its data.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$center_event = $wpdb->get_row(
+			$wpdb->prepare(
+				'SELECT id, date FROM %i WHERE id = %d',
+				$events_table_name,
+				$center_event_id
+			)
+		);
+
+		if ( ! $center_event ) {
+			return new \WP_Error(
+				'event_not_found',
+				__( 'The specified event was not found.', 'simple-history' ),
+				[ 'status' => 404 ]
+			);
+		}
+
+		// Get events AFTER the center event (newer, higher IDs).
+		// Order by id ASC to get the events closest to center first (lowest IDs above center),
+		// then reverse so newest is first for display (matching the main event log order).
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$events_after = $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT
+					id, logger, level, date, message, initiator, occasionsID,
+					1 AS repeatCount, 1 AS subsequentOccasions
+				FROM %i
+				WHERE id > %d
+				ORDER BY id ASC
+				LIMIT %d',
+				$events_table_name,
+				$center_event_id,
+				$surrounding_count
+			),
+			OBJECT_K
+		);
+
+		// Reverse to get newest first (DESC order) for consistent display with main log.
+		// Example: Query returns [2976, 2977, 2978] (ASC), reverse to [2978, 2977, 2976] (DESC).
+		$events_after = array_reverse( $events_after, true );
+
+		// Get the center event with full data.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$center_event_full = $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT
+					id, logger, level, date, message, initiator, occasionsID,
+					1 AS repeatCount, 1 AS subsequentOccasions
+				FROM %i
+				WHERE id = %d',
+				$events_table_name,
+				$center_event_id
+			),
+			OBJECT_K
+		);
+
+		// Get events BEFORE the center event (older, lower IDs).
+		// Order by id DESC to get newest (closest to center) first.
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$events_before = $wpdb->get_results(
+			$wpdb->prepare(
+				'SELECT
+					id, logger, level, date, message, initiator, occasionsID,
+					1 AS repeatCount, 1 AS subsequentOccasions
+				FROM %i
+				WHERE id < %d
+				ORDER BY id DESC
+				LIMIT %d',
+				$events_table_name,
+				$center_event_id,
+				$surrounding_count
+			),
+			OBJECT_K
+		);
+
+		// Combine all events: after + center + before (reverse chronological order, newest first).
+		$all_events = $events_after + $center_event_full + $events_before;
+
+		// Add context data to all events.
+		$all_events = $this->add_contexts_to_log_rows( $all_events );
+
+		// Convert to indexed array.
+		$log_rows = array_values( $all_events );
+
+		// Calculate metadata.
+		$events_before_count = count( $events_before );
+		$events_after_count  = count( $events_after );
+		$total_count         = count( $log_rows );
+
+		// Get max/min IDs and max date.
+		$max_id   = null;
+		$min_id   = null;
+		$max_date = null;
+
+		if ( $total_count > 0 ) {
+			// Events are in reverse chronological order (newest first), so:
+			// - max_id is the first event (newest, highest ID).
+			// - min_id is the last event (oldest, lowest ID).
+			$max_id   = (int) $log_rows[0]->id;
+			$min_id   = (int) $log_rows[ $total_count - 1 ]->id;
+			$max_date = $log_rows[0]->date;
+		}
+
+		return [
+			'log_rows'        => $log_rows,
+			'center_event_id' => $center_event_id,
+			'total_row_count' => $total_count,
+			'events_before'   => $events_before_count,
+			'events_after'    => $events_after_count,
+			'max_id'          => $max_id,
+			'min_id'          => $min_id,
+			'max_date'        => $max_date,
+			'log_rows_count'  => $total_count,
+			// Standard pagination fields (not really applicable but included for consistency).
+			'pages_count'     => 1,
+			'page_current'    => 1,
+			'page_rows_from'  => 1,
+			'page_rows_to'    => $total_count,
+		];
+	}
+
+	/**
+	 * How long an aggregate result is cached for, in seconds.
+	 *
+	 * @since 5.34.0
+	 */
+	const AGGREGATE_CACHE_SECONDS = 60;
+
+	/**
+	 * How many aggregate results one user's cache entry holds.
+	 *
+	 * Enough for a reader moving between a few saved views and back, and far
+	 * short of what a search box can generate in a minute.
+	 *
+	 * @since 5.34.0
+	 */
+	const AGGREGATE_CACHE_ENTRIES = 10;
+
+	/**
+	 * Count the events matching a query, grouped into buckets.
+	 *
+	 * Answers "how many, by what" for the same filters that decide which
+	 * events a listing returns — how many per day, how many of each level,
+	 * which loggers are busiest. A caller that wanted this before had to
+	 * fetch the events and count them client-side, which is only correct
+	 * when the whole result set fits in one page.
+	 *
+	 * Only columns on the events table can be grouped by. Grouping by user
+	 * or by message key would mean joining the contexts table, and
+	 * get_inner_where() writes unqualified column names (`id`, `date`,
+	 * `logger`), which stop being unambiguous the moment a second table is
+	 * in the query. Adding those two means teaching get_inner_where() to
+	 * prefix its columns first — worth doing, but not as a side effect of
+	 * this method.
+	 *
+	 * @since 5.34.0
+	 * @param array $args {
+	 *     Query arguments. Every filtering argument query() accepts, plus these.
+	 *
+	 *     @type string $group_by       What to count by: 'date', 'level',
+	 *                                  'logger' or 'initiator'. Default 'date'.
+	 *     @type string $interval       For 'date', the bucket size: 'day' or 'hour'.
+	 *                                  Default 'day'.
+	 *     @type bool   $split_by_level Also split each bucket by log level, so a
+	 *                                  date histogram can be stacked. Default false.
+	 *     @type int    $max_buckets    Most buckets to return. Default 500. Counts
+	 *                                  buckets, not rows: with $split_by_level the
+	 *                                  row limit is raised to match, since each
+	 *                                  bucket can produce one row per log level.
+	 * }
+	 * @return array|\WP_Error Array of { bucket, level, count }, or an error.
+	 */
+	public function query_aggregate( $args ) {
+		$group_by       = isset( $args['group_by'] ) ? (string) $args['group_by'] : 'date';
+		$interval       = isset( $args['interval'] ) ? (string) $args['interval'] : 'day';
+		$split_by_level = ! empty( $args['split_by_level'] );
+		$max_buckets    = max( 1, isset( $args['max_buckets'] ) ? (int) $args['max_buckets'] : 500 );
+
+		$bucket_expression = $this->get_aggregate_bucket_expression( $group_by, $interval );
+
+		if ( $bucket_expression === null ) {
+			return new \WP_Error(
+				'simple_history_invalid_group_by',
+				__( 'Events can not be grouped by that.', 'simple-history' ),
+				[ 'status' => 400 ]
+			);
+		}
+
+		$args = $this->prepare_args( $args );
+
+		// Cached for a minute, per user.
+		//
+		// This is a GROUP BY over the events table with no index behind most
+		// of the groupings, and LIMIT caps the response rather than the work.
+		// The histogram refires on every filter change, so typing in the
+		// search box issues one of these per keystroke — invisible on a small
+		// log, seconds each on a site with millions of rows, from an account
+		// that only needs the view-history capability.
+		//
+		// A transient rather than wp_cache_*, which the rest of this class
+		// uses: without a persistent object cache those last one request,
+		// which is no protection at all against a repeated call. Keyed on the
+		// user because the query is filtered by the loggers that user may
+		// read. A minute is well inside what an activity histogram needs to
+		// be honest.
+		//
+		// ONE transient per user holding a small map, rather than one per set
+		// of filters. The filters used to be part of the key, which meant a
+		// site with no persistent object cache got a new wp_options row per
+		// keystroke in the search box — each one only collected by the daily
+		// wp_scheduled_delete. The map is capped, so a user costs one row
+		// whatever they type.
+		$cache_key   = 'sh_agg_' . get_current_user_id();
+		$cache_entry = md5(
+			// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_serialize
+			serialize( [ $args, $group_by, $interval, $split_by_level, $max_buckets ] )
+		);
+
+		$cached = get_transient( $cache_key );
+		$cached = is_array( $cached ) ? $cached : [];
+
+		if ( isset( $cached[ $cache_entry ] ) ) {
+			return $cached[ $cache_entry ];
+		}
+
+		global $wpdb;
+
+		$table_name = Simple_History::get_instance()->get_events_table_name();
+
+		$inner_where_array  = $this->get_inner_where( $args );
+		$inner_where_string = empty( $inner_where_array )
+			? ''
+			: "\nWHERE " . implode( "\nAND ", $inner_where_array );
+
+		$select_parts   = [ $bucket_expression . ' AS bucket' ];
+		$group_by_parts = [ 'bucket' ];
+
+		if ( $split_by_level ) {
+			$select_parts[]   = 'level AS bucket_level';
+			$group_by_parts[] = 'bucket_level';
+		}
+
+		$select_parts[] = 'COUNT(*) AS bucket_count';
+
+		// How many ROWS to fetch — not how many buckets to return. With
+		// split_by_level one bucket is up to one row per level, so the two
+		// are only the same number when the split is off.
+		//
+		// This is a bound on the work, and the real cap is applied in PHP
+		// below. Scaling it and calling that the cap was wrong twice over: a
+		// bucket rarely uses all eight levels, so 500 buckets' worth of rows
+		// held far more than 500 buckets; and because LIMIT cuts at a row
+		// boundary it could cut inside a bucket, leaving the oldest one
+		// holding only some of its levels. A bar quietly missing half its
+		// events is worse than a bar that is not drawn at all.
+		$rows_per_bucket = $split_by_level ? count( Log_Levels::get_log_levels_by_severity() ) : 1;
+		$row_limit       = $max_buckets * $rows_per_bucket;
+
+		// Not built with prepare(): every part of this statement is either a
+		// table name or one of the fixed expressions get_aggregate_bucket_expression()
+		// returns, and the filtering values are already prepared inside
+		// get_inner_where(). $row_limit is derived from an int cast above.
+		$sql_query = implode(
+			"\n",
+			[
+				'SELECT ' . implode( ', ', $select_parts ),
+				'FROM ' . $table_name,
+				$inner_where_string,
+				'GROUP BY ' . implode( ', ', $group_by_parts ),
+				// Descending, then reversed in PHP below, so the cap drops
+				// the OLDEST buckets rather than the newest. Ascending plus
+				// LIMIT kept the first 500 buckets, so a log spanning more
+				// than 500 days drew a chart that stopped well before today
+				// with nothing to say it had been cut — and at hourly
+				// resolution 500 buckets is only about three weeks.
+				'ORDER BY ' . implode( ', ', array_map( static fn( $part ) => $part . ' DESC', $group_by_parts ) ),
+				sprintf( 'LIMIT %d', $row_limit ),
+			]
+		);
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+		$rows = $wpdb->get_results( $sql_query );
+
+		if ( ! empty( $wpdb->last_error ) ) {
+			// The database's own error text does not go to the client.
+			//
+			// This is reachable by anyone who can read the log —
+			// get_view_history_capability(), which defaults to edit_pages —
+			// and MySQL error strings carry table prefixes, column names and
+			// fragments of the statement. The reader can do nothing with the
+			// detail anyway; whoever can fix it reads the error log.
+			self::log_db_error( $wpdb->last_error );
+
+			return new \WP_Error(
+				'simple_history_db_error',
+				__( 'Database query failed.', 'simple-history' ),
+				[ 'status' => 500 ]
+			);
+		}
+
+		$rows = (array) $rows;
+
+		// Rows arrive newest bucket first. Walk them keeping whole buckets
+		// until max_buckets of them have been seen, which is the cap the
+		// caller actually asked for and the one LIMIT cannot express.
+		$seen_buckets   = [];
+		$kept           = [];
+		$hit_bucket_cap = false;
+
+		foreach ( $rows as $row ) {
+			$seen_buckets[ (string) $row->bucket ] = true;
+
+			if ( count( $seen_buckets ) > $max_buckets ) {
+				$hit_bucket_cap = true;
+				break;
+			}
+
+			$kept[] = $row;
+		}
+
+		$kept_buckets = [];
+
+		foreach ( $kept as $row ) {
+			$kept_buckets[ (string) $row->bucket ] = true;
+		}
+
+		// If the fetch came back exactly full, the statement ran out of rows
+		// rather than out of buckets, so the oldest bucket in it may be a
+		// partial one — see the note on $row_limit. Drop it, unless it is the
+		// only bucket there is, in which case a short bar beats no chart.
+		//
+		// Only when LIMIT could actually have cut inside a bucket, which is
+		// narrower than "the fetch was full":
+		//
+		// - Without $split_by_level a bucket is exactly one row, so
+		// $row_limit === $max_buckets and the cut always lands on a
+		// boundary. This dropped the oldest bucket from every chart of a
+		// log with at least $max_buckets buckets — on a log with 500 days
+		// of events, the 500th day silently vanished.
+		// - If the loop broke on the bucket cap, it stopped on a boundary
+		// itself, so whatever LIMIT did afterwards is irrelevant.
+		if (
+			$split_by_level &&
+			! $hit_bucket_cap &&
+			count( $rows ) === $row_limit &&
+			count( $kept_buckets ) > 1
+		) {
+			$partial = (string) end( $kept )->bucket;
+
+			$kept = array_values(
+				array_filter(
+					$kept,
+					static function ( $row ) use ( $partial ) {
+						return (string) $row->bucket !== $partial;
+					}
+				)
+			);
+		}
+
+		$buckets = [];
+
+		// Back to chronological. Reversing the rows also puts bucket_level
+		// back in ascending order, which is why the statement above sorts
+		// every GROUP BY part descending rather than just the bucket.
+		$rows = array_reverse( $kept );
+
+		foreach ( $rows as $row ) {
+			$buckets[] = [
+				'bucket' => (string) $row->bucket,
+				'level'  => $split_by_level ? (string) $row->bucket_level : null,
+				'count'  => (int) $row->bucket_count,
+			];
+		}
+
+		// Newest last, and the oldest dropped once the map is full. Typing in
+		// the search box walks through entries nobody will ask for again, so
+		// an uncapped map would grow inside the row instead of across rows.
+		$cached[ $cache_entry ] = $buckets;
+
+		if ( count( $cached ) > self::AGGREGATE_CACHE_ENTRIES ) {
+			$cached = array_slice(
+				$cached,
+				-self::AGGREGATE_CACHE_ENTRIES,
+				null,
+				true
+			);
+		}
+
+		set_transient( $cache_key, $cached, self::AGGREGATE_CACHE_SECONDS );
+
+		return $buckets;
+	}
+
+	/**
+	 * The SQL expression that turns one event row into its bucket.
+	 *
+	 * Returns null for anything not in the allowed set, so a caller can
+	 * never interpolate a value of its own into the statement.
+	 *
+	 * @since 5.34.0
+	 * @param string $group_by What to group by.
+	 * @param string $interval Bucket size, when grouping by date.
+	 * @return string|null The expression, or null when the grouping is unknown.
+	 */
+	protected function get_aggregate_bucket_expression( $group_by, $interval ) {
+		if ( in_array( $group_by, [ 'level', 'logger', 'initiator' ], true ) ) {
+			return $group_by;
+		}
+
+		if ( $group_by !== 'date' ) {
+			return null;
+		}
+
+		// Events are stored in GMT, but a histogram is read next to a table
+		// that shows local times, so the buckets have to be local too.
+		// Without this an event logged at 12:13 in a UTC+2 site landed in
+		// the 10:00 bucket — two hours out of step with the row beside it —
+		// and at the day boundary an event just after midnight was counted
+		// against the previous day. Same approach as
+		// Events_Stats::get_activity_by_date(): add the offset rather than
+		// CONVERT_TZ(), which needs timezone tables the host may not have
+		// loaded.
+		//
+		// The current offset is applied to every row, so a range spanning a
+		// daylight-saving change is off by an hour on one side of it. Doing
+		// better means a per-row lookup the database cannot do, and an hour
+		// twice a year is a far smaller error than the two this replaces.
+		$offset = (int) self::get_local_offset_seconds();
+
+		if ( $interval === 'hour' ) {
+			// DATE_FORMAT is MySQL-only and strftime is SQLite-only, so this
+			// is one of the places that has to know which database it is on.
+			return self::get_db_engine() === 'sqlite'
+				? sprintf( "strftime('%%Y-%%m-%%d %%H:00:00', date, '%+d seconds')", $offset )
+				: sprintf( "DATE_FORMAT(DATE_ADD(date, INTERVAL %d SECOND), '%%Y-%%m-%%d %%H:00:00')", $offset );
+		}
+
+		return self::get_db_engine() === 'sqlite'
+			? sprintf( "date(date, '%+d seconds')", $offset )
+			: sprintf( 'DATE(DATE_ADD(date, INTERVAL %d SECOND))', $offset );
+	}
+
+	/**
+	 * The site's current UTC offset, in seconds.
+	 *
+	 * @since 5.34.0
+	 * @return int Offset in seconds, negative west of Greenwich.
+	 */
+	protected static function get_local_offset_seconds() {
+		$timezone = wp_timezone();
+
+		return $timezone->getOffset( new \DateTime( 'now', $timezone ) );
+	}
+
+	/**
+	 * Prepare arguments, i.e. checking that they are valid,
+	 * of the correct type, etc.
+	 *
+	 * @param array $args Argument.
+	 * @return array
+	 * @throws \InvalidArgumentException If invalid type.
+	 */
+	protected function prepare_args( $args ) {
+		/** @var array Query arguments. */
+		$args = wp_parse_args(
+			$args,
+			[
+				// overview | occasions | single.
+				// When type is occasions then logRowID, occasionsID, occasionsCount, occasionsCountMaxReturn are required.
+				'type'              => 'overview',
+
+				// Number of posts to show per page. 0 to show all.
+				'posts_per_page'    => 10,
+
+				// Page to show. 1 = first page.
+				'paged'             => 1,
+
+				// Array. Only get posts that are in array.
+				'post__in'          => [],
+
+				// If max_id_first_page is set then only get rows
+				// that have id equal or lower than this, to make.
+				'max_id_first_page' => null,
+
+				// if since_id is set the rows returned will only be rows with an ID greater than (i.e. more recent than) since_id.
+				'since_id'          => null,
+
+				// if since_date is set, used together with since_id to accurately detect new events with date ordering.
+				// Only returns events with date > since_date OR (date = since_date AND id > since_id).
+				'since_date'        => null,
+				/**
+				 * From date, as unix timestamp integer or as a format compatible with strtotime, for example 'Y-m-d H:i:s'.
+				 *
+				 * @var int|string
+				 */
+				'date_from'         => null,
+
+				/**
+				* To date, as unix timestamp integer or as a format compatible with strtotime, for example 'Y-m-d H:i:s'.
+				*
+				* @var int|string
+				*/
+				'date_to'           => null,
+
+				// months in format "Y-m"
+				// array or comma separated.
+				'months'            => null,
+
+				// dates in format
+				// "month:2015-06" for june 2015
+				// "lastdays:7" for the last 7 days.
+				'dates'             => null,
+
+				/**
+				 * Text to search for.
+				 * Message, logger and level are searched for in main table.
+				 * Values are searched for in context table.
+				 *
+				 * @var string
+				 */
+				'search'            => null,
+
+				// log levels to include. comma separated or as array. defaults to all.
+				'loglevels'         => null,
+
+				// loggers to include. comma separated. defaults to all the user can read.
+				'loggers'           => null,
+
+				'messages'          => null,
+
+				// userID as number.
+				'user'              => null,
+
+				// User ids, comma separated or array.
+				'users'             => null,
+
+				// Initiator to filter by.
+				'initiator'         => null,
+
+				// IP address to filter by. Supports partial matching for anonymized IPs.
+				'ip_address'        => null,
+
+				// Should sticky events be included in the result set.
+				'include_sticky'    => false,
+
+				// Only return sticky events.
+				'only_sticky'       => false,
+
+				// Context filters as key-value pairs.
+				'context_filters'   => null,
+
+				// Metadata search: plain text search across all context values.
+				'metadata_search'   => null,
+
+				// When true, only return events that have an AI agent attribution
+				// (any value of the `_initiator_ai_agent` context key).
+				'ai_only'           => false,
+
+				// Return ungrouped events without occasions grouping.
+				'ungrouped'         => false,
+
+				// Skip the count query for total rows. Useful for feeds
+				// and other consumers that don't need pagination metadata.
+				'skip_count_query'  => false,
+
+				// Exclusion filters - hide events matching these criteria.
+				// Text to exclude from search.
+				'exclude_search'    => null,
+
+				// Log levels to exclude, comma separated or array.
+				'exclude_loglevels' => null,
+
+				// Loggers to exclude, comma separated or array.
+				'exclude_loggers'   => null,
+
+				// Messages to exclude, comma separated or array in format "LoggerSlug:Message".
+				'exclude_messages'  => null,
+
+				// Single user ID to exclude.
+				'exclude_user'      => null,
+
+				// User IDs to exclude, comma separated or array.
+				'exclude_users'     => null,
+
+				// Initiator(s) to exclude.
+				'exclude_initiator' => null,
+
+				// Column to sort by. See the query() docblock for accepted values.
+				'orderby'           => 'date',
+
+				// Sort direction, ASC or DESC.
+				'order'             => 'DESC',
+
+			// Can also contain:
+			// logRowID
+			// occasionsCount
+			// occasionsCountMaxReturn
+			// occasionsID.
+			]
+		);
+
+		// Type must be string and any of "overview", "occasions", "single".
+		if ( ! is_string( $args['type'] ) && ! in_array( $args['type'], [ 'overview', 'occasions', 'single' ], true ) ) {
+			throw new \InvalidArgumentException( 'Invalid type' );
+		}
+
+		// If occasionsCountMaxReturn is set then it must be an integer.
+		if ( isset( $args['occasionsCountMaxReturn'] ) && ! is_numeric( $args['occasionsCountMaxReturn'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid occasionsCountMaxReturn' );
+		}
+
+		if ( isset( $args['occasionsCountMaxReturn'] ) ) {
+			$args['occasionsCountMaxReturn'] = (int) $args['occasionsCountMaxReturn'];
+		}
+
+		// If occasionsCount is set then it must be an integer.
+		if ( isset( $args['occasionsCount'] ) && ! is_numeric( $args['occasionsCount'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid occasionsCount' );
+		}
+
+		if ( isset( $args['occasionsCount'] ) ) {
+			$args['occasionsCount'] = (int) $args['occasionsCount'];
+		}
+
+		// If posts_per_page is set then it must be a positive integer.
+		if ( isset( $args['posts_per_page'] ) && ( ! is_numeric( $args['posts_per_page'] ) || $args['posts_per_page'] < 1 ) ) {
+			throw new \InvalidArgumentException( 'Invalid posts_per_page' );
+		}
+
+		if ( isset( $args['posts_per_page'] ) ) {
+			$args['posts_per_page'] = (int) $args['posts_per_page'];
+		}
+
+		// paged must be must be a positive integer.
+		if ( isset( $args['paged'] ) && ( ! is_numeric( $args['paged'] ) || $args['paged'] < 1 ) ) {
+			throw new \InvalidArgumentException( 'Invalid paged' );
+		}
+
+		if ( isset( $args['paged'] ) ) {
+			$args['paged'] = (int) $args['paged'];
+		}
+
+		// Normalise orderby to a known column. An unknown value falls back to
+		// the default rather than throwing, the same way an out-of-range
+		// posts_per_page is clamped. The value never reaches SQL as-is — it is
+		// mapped to a literal column name in get_order_by_clause().
+		if ( ! isset( $args['orderby'] ) || ! in_array( $args['orderby'], self::ORDERBY_COLUMNS, true ) ) {
+			$args['orderby'] = 'date';
+		}
+
+		// Normalise order to ASC or DESC.
+		$order = isset( $args['order'] ) ? strtoupper( (string) $args['order'] ) : 'DESC';
+
+		$args['order'] = in_array( $order, [ 'ASC', 'DESC' ], true ) ? $order : 'DESC';
+
+		// Occasion grouping counts consecutive rows with the same occasionsID,
+		// which only holds while rows arrive in date order. Sorting by anything
+		// else means the grouped query cannot run, so drop the grouping rather
+		// than silently returning date-ordered rows.
+		if ( $args['orderby'] !== 'date' || $args['order'] !== 'DESC' ) {
+			$args['ungrouped'] = true;
+		}
+
+		// "post__in" must be array and must only contain integers.
+		if ( isset( $args['post__in'] ) && ! is_array( $args['post__in'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid post__in' );
+		}
+
+		if ( isset( $args['post__in'] ) ) {
+			$args['post__in'] = array_map( 'intval', $args['post__in'] );
+			$args['post__in'] = array_filter( $args['post__in'] );
+		}
+
+		// "max_id_first_page" must be integer.
+		if ( isset( $args['max_id_first_page'] ) && ! is_numeric( $args['max_id_first_page'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid max_id_first_page' );
+		}
+
+		if ( isset( $args['max_id_first_page'] ) ) {
+			$args['max_id_first_page'] = (int) $args['max_id_first_page'];
+		}
+
+		// "since_id" must be integer.
+		if ( isset( $args['since_id'] ) && ! is_numeric( $args['since_id'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid since_id' );
+		}
+
+		if ( isset( $args['since_id'] ) ) {
+			$args['since_id'] = (int) $args['since_id'];
+		}
+
+		// "since_date" must be valid date string in format Y-m-d H:i:s.
+		if ( isset( $args['since_date'] ) ) {
+			if ( ! is_string( $args['since_date'] ) ) {
+				throw new \InvalidArgumentException( 'Invalid since_date: must be a string' );
+			}
+
+			// Strict format validation to prevent SQL injection.
+			$parsed_date = \DateTime::createFromFormat( 'Y-m-d H:i:s', $args['since_date'] );
+			if ( ! $parsed_date || $parsed_date->format( 'Y-m-d H:i:s' ) !== $args['since_date'] ) {
+				throw new \InvalidArgumentException( 'Invalid since_date format. Use Y-m-d H:i:s (e.g., 2024-01-15 14:30:00)' );
+			}
+		}
+
+		// Treat empty or whitespace-only date strings as "no date filter".
+		// Without this, DateTimeImmutable parses an empty string as "now",
+		// silently turning the query into "date >= now" and matching nothing.
+		if ( isset( $args['date_from'] ) && is_string( $args['date_from'] ) && trim( $args['date_from'] ) === '' ) {
+			$args['date_from'] = null;
+		}
+
+		if ( isset( $args['date_to'] ) && is_string( $args['date_to'] ) && trim( $args['date_to'] ) === '' ) {
+			$args['date_to'] = null;
+		}
+
+		// "date_from" must be timestamp or string. If string then convert to timestamp.
+		// A bare "Y-m-d" date means the beginning of that day in WordPress timezone.
+		if ( isset( $args['date_from'] ) ) {
+			$args['date_from'] = $this->convert_date_arg_to_timestamp( $args['date_from'], 'date_from', '00:00:00' );
+		}
+
+		// "date_to" must be timestamp or string. If string then convert to timestamp.
+		// A bare "Y-m-d" date means the end of that day in WordPress timezone.
+		if ( isset( $args['date_to'] ) ) {
+			$args['date_to'] = $this->convert_date_arg_to_timestamp( $args['date_to'], 'date_to', '23:59:59' );
+		}
+
+		// "search" must be string.
+		if ( isset( $args['search'] ) && ! is_string( $args['search'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid search' );
+		}
+
+		// "loglevels" must be comma separated string "info,debug"
+		// or array of log level strings.
+		if ( isset( $args['loglevels'] ) && ! is_string( $args['loglevels'] ) && ! is_array( $args['loglevels'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid loglevels' );
+		}
+
+		if ( isset( $args['loglevels'] ) && is_string( $args['loglevels'] ) ) {
+			$args['loglevels'] = explode( ',', $args['loglevels'] );
+		}
+
+		// Make sure loglevels are trimmed, strings, and empty vals removed.
+		if ( isset( $args['loglevels'] ) ) {
+			$args['loglevels'] = array_map( 'trim', $args['loglevels'] );
+			$args['loglevels'] = array_map( 'strval', $args['loglevels'] );
+			$args['loglevels'] = array_filter( $args['loglevels'] );
+		}
+
+		// phpcs:ignore Squiz.PHP.CommentedOutCode.Found
+		// "messages" is string with comma separated loggers and messages,
+		// or array with comma separated loggers and messages.
+		// Array example:
+		// Array
+		// (
+		// [0] => SimpleCommentsLogger:anon_comment_added,SimpleCommentsLogger:user_comment_added,SimpleCommentsLogger:anon_trackback_added,SimpleCommentsLogger:user_trackback_added,SimpleCommentsLogger:anon_pingback_added,SimpleCommentsLogger:user_pingback_added,SimpleCommentsLogger:comment_edited,SimpleCommentsLogger:trackback_edited,SimpleCommentsLogger:pingback_edited,SimpleCommentsLogger:comment_status_approve,SimpleCommentsLogger:trackback_status_approve,SimpleCommentsLogger:pingback_status_approve,SimpleCommentsLogger:comment_status_hold,SimpleCommentsLogger:trackback_status_hold,SimpleCommentsLogger:pingback_status_hold,SimpleCommentsLogger:comment_status_spam,SimpleCommentsLogger:trackback_status_spam,SimpleCommentsLogger:pingback_status_spam,SimpleCommentsLogger:comment_status_trash,SimpleCommentsLogger:trackback_status_trash,SimpleCommentsLogger:pingback_status_trash,SimpleCommentsLogger:comment_untrashed,SimpleCommentsLogger:trackback_untrashed,SimpleCommentsLogger:pingback_untrashed,SimpleCommentsLogger:comment_deleted,SimpleCommentsLogger:trackback_deleted,SimpleCommentsLogger:pingback_deleted
+		// [1] => SimpleCommentsLogger:SimpleCommentsLogger:comment_status_spam,SimpleCommentsLogger:trackback_status_spam,SimpleCommentsLogger:pingback_status_spam
+		// )
+		if ( isset( $args['messages'] ) && ! is_string( $args['messages'] ) && ! is_array( $args['messages'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid messages' );
+		}
+
+		if ( isset( $args['messages'] ) && is_string( $args['messages'] ) ) {
+			$args['messages'] = explode( ',', $args['messages'] );
+		} elseif ( isset( $args['messages'] ) && is_array( $args['messages'] ) ) {
+			// Turn multi dimensional array into single array with strings.
+			$arr_messages = [];
+			foreach ( $args['messages'] as $one_arr_messages_row ) {
+				$arr_messages = array_merge( $arr_messages, explode( ',', $one_arr_messages_row ) );
+			}
+
+			$args['messages'] = $arr_messages;
+		}
+
+		// Make sure messages are trimmed, strings, and empty vals removed.
+		if ( isset( $args['messages'] ) ) {
+			$args['messages'] = array_map( 'trim', $args['messages'] );
+			$args['messages'] = array_map( 'strval', $args['messages'] );
+			$args['messages'] = array_filter( $args['messages'] );
+
+			$arr_loggers_and_messages = [];
+
+			// Transform to format where
+			// - key = logger slug.
+			// - value = array of logger messages..
+			foreach ( $args['messages'] as $one_row_logger_and_message ) {
+				$arr_one_logger_and_message = explode( ':', $one_row_logger_and_message );
+
+				// Skip malformed entries without colon (must have at least logger:message format).
+				if ( count( $arr_one_logger_and_message ) < 2 ) {
+					continue;
+				}
+
+				$logger_slug = $arr_one_logger_and_message[0];
+				$message_key = $arr_one_logger_and_message[1];
+
+				if ( ! isset( $arr_loggers_and_messages[ $logger_slug ] ) ) {
+					$arr_loggers_and_messages[ $logger_slug ] = array();
+				}
+
+				$arr_loggers_and_messages[ $logger_slug ][] = $message_key;
+			}
+
+			$args['messages'] = $arr_loggers_and_messages;
+		}
+
+		// "loggers", comma separated string or array with strings.
+		// Example format: "AvailableUpdatesLogger,SimpleuserLogger".
+		if ( isset( $args['loggers'] ) && ! is_string( $args['loggers'] ) && ! is_array( $args['loggers'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid loggers' );
+		}
+
+		if ( isset( $args['loggers'] ) && is_string( $args['loggers'] ) ) {
+			$args['loggers'] = explode( ',', $args['loggers'] );
+		}
+
+		// "user" must be integer.
+		if ( isset( $args['user'] ) && ! is_numeric( $args['user'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid user' );
+		}
+
+		if ( isset( $args['user'] ) ) {
+			$args['user'] = (int) $args['user'];
+		}
+
+		// "users" must be comma separated string or array with integers.
+		if ( isset( $args['users'] ) && ! is_string( $args['users'] ) && ! is_array( $args['users'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid users' );
+		}
+
+		if ( isset( $args['users'] ) && is_string( $args['users'] ) ) {
+			$args['users'] = explode( ',', $args['users'] );
+		}
+
+		// Make sure users are integers and remove empty vals.
+		if ( isset( $args['users'] ) ) {
+			$args['users'] = array_map( 'intval', $args['users'] );
+			$args['users'] = array_filter( $args['users'] );
+		}
+
+		// "initiator" must be string or array of strings and contain valid initiator constants.
+		if ( isset( $args['initiator'] ) ) {
+			if ( is_string( $args['initiator'] ) ) {
+				// Single initiator - validate it's a valid constant.
+				if ( ! in_array( $args['initiator'], Log_Initiators::get_valid_initiators(), true ) ) {
+					throw new \InvalidArgumentException( 'Invalid initiator value' );
+				}
+			} elseif ( is_array( $args['initiator'] ) ) {
+				// Multiple initiators - validate each one and filter out empty values.
+				$args['initiator'] = array_filter( $args['initiator'] );
+				foreach ( $args['initiator'] as $initiator ) {
+					if ( ! is_string( $initiator ) || ! in_array( $initiator, Log_Initiators::get_valid_initiators(), true ) ) {
+						throw new \InvalidArgumentException( 'Invalid initiator value: ' . esc_html( $initiator ) );
+					}
+				}
+			} else {
+				throw new \InvalidArgumentException( 'Invalid initiator type' );
+			}
+		}
+
+		// Process exclusion filters using the same validation logic as inclusion filters.
+		// "exclude_search" must be string.
+		if ( isset( $args['exclude_search'] ) && ! is_string( $args['exclude_search'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid exclude_search' );
+		}
+
+		// "exclude_loglevels", comma separated string or array with strings.
+		if ( isset( $args['exclude_loglevels'] ) && ! is_string( $args['exclude_loglevels'] ) && ! is_array( $args['exclude_loglevels'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid exclude_loglevels' );
+		}
+
+		if ( isset( $args['exclude_loglevels'] ) && is_string( $args['exclude_loglevels'] ) ) {
+			$args['exclude_loglevels'] = explode( ',', $args['exclude_loglevels'] );
+		}
+
+		// Make sure exclude_loglevels are trimmed, strings, and empty vals removed.
+		if ( isset( $args['exclude_loglevels'] ) ) {
+			$args['exclude_loglevels'] = array_map( 'trim', $args['exclude_loglevels'] );
+			$args['exclude_loglevels'] = array_map( 'strval', $args['exclude_loglevels'] );
+			$args['exclude_loglevels'] = array_filter( $args['exclude_loglevels'] );
+		}
+
+		// "exclude_loggers", comma separated string or array with strings.
+		if ( isset( $args['exclude_loggers'] ) && ! is_string( $args['exclude_loggers'] ) && ! is_array( $args['exclude_loggers'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid exclude_loggers' );
+		}
+
+		if ( isset( $args['exclude_loggers'] ) && is_string( $args['exclude_loggers'] ) ) {
+			$args['exclude_loggers'] = explode( ',', $args['exclude_loggers'] );
+		}
+
+		// Make sure exclude_loggers are trimmed, strings, and empty vals removed.
+		if ( isset( $args['exclude_loggers'] ) ) {
+			$args['exclude_loggers'] = array_map( 'trim', $args['exclude_loggers'] );
+			$args['exclude_loggers'] = array_map( 'strval', $args['exclude_loggers'] );
+			$args['exclude_loggers'] = array_filter( $args['exclude_loggers'] );
+		}
+
+		// "exclude_messages" is string with comma separated loggers and messages, or array.
+		if ( isset( $args['exclude_messages'] ) && ! is_string( $args['exclude_messages'] ) && ! is_array( $args['exclude_messages'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid exclude_messages' );
+		}
+
+		if ( isset( $args['exclude_messages'] ) && is_string( $args['exclude_messages'] ) ) {
+			$args['exclude_messages'] = explode( ',', $args['exclude_messages'] );
+		} elseif ( isset( $args['exclude_messages'] ) && is_array( $args['exclude_messages'] ) ) {
+			// Turn multi dimensional array into single array with strings.
+			$arr_exclude_messages = [];
+			foreach ( $args['exclude_messages'] as $one_arr_messages_row ) {
+				$arr_exclude_messages = array_merge( $arr_exclude_messages, explode( ',', $one_arr_messages_row ) );
+			}
+
+			$args['exclude_messages'] = $arr_exclude_messages;
+		}
+
+		// Make sure exclude_messages are trimmed, strings, and empty vals removed.
+		// Transform to format where key = logger slug, value = array of logger messages.
+		if ( isset( $args['exclude_messages'] ) ) {
+			$args['exclude_messages'] = array_map( 'trim', $args['exclude_messages'] );
+			$args['exclude_messages'] = array_map( 'strval', $args['exclude_messages'] );
+			$args['exclude_messages'] = array_filter( $args['exclude_messages'] );
+
+			$arr_exclude_loggers_and_messages = [];
+
+			foreach ( $args['exclude_messages'] as $one_row_logger_and_message ) {
+				$arr_one_logger_and_message = explode( ':', $one_row_logger_and_message );
+
+				// Skip malformed entries without colon (must have at least logger:message format).
+				if ( count( $arr_one_logger_and_message ) < 2 ) {
+					continue;
+				}
+
+				$logger_slug = $arr_one_logger_and_message[0];
+				$message_key = $arr_one_logger_and_message[1];
+
+				if ( ! isset( $arr_exclude_loggers_and_messages[ $logger_slug ] ) ) {
+					$arr_exclude_loggers_and_messages[ $logger_slug ] = array();
+				}
+
+				$arr_exclude_loggers_and_messages[ $logger_slug ][] = $message_key;
+			}
+
+			$args['exclude_messages'] = $arr_exclude_loggers_and_messages;
+		}
+
+		// "exclude_user" must be integer.
+		if ( isset( $args['exclude_user'] ) && ! is_numeric( $args['exclude_user'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid exclude_user' );
+		}
+
+		if ( isset( $args['exclude_user'] ) ) {
+			$args['exclude_user'] = (int) $args['exclude_user'];
+		}
+
+		// "exclude_users" must be comma separated string or array with integers.
+		if ( isset( $args['exclude_users'] ) && ! is_string( $args['exclude_users'] ) && ! is_array( $args['exclude_users'] ) ) {
+			throw new \InvalidArgumentException( 'Invalid exclude_users' );
+		}
+
+		if ( isset( $args['exclude_users'] ) && is_string( $args['exclude_users'] ) ) {
+			$args['exclude_users'] = explode( ',', $args['exclude_users'] );
+		}
+
+		// Make sure exclude_users are integers and remove empty vals.
+		if ( isset( $args['exclude_users'] ) ) {
+			$args['exclude_users'] = array_map( 'intval', $args['exclude_users'] );
+			$args['exclude_users'] = array_filter( $args['exclude_users'] );
+		}
+
+		// "exclude_initiator" must be string or array of strings and contain valid initiator constants.
+		if ( isset( $args['exclude_initiator'] ) ) {
+			if ( is_string( $args['exclude_initiator'] ) ) {
+				// Single initiator - validate it's a valid constant.
+				if ( ! in_array( $args['exclude_initiator'], Log_Initiators::get_valid_initiators(), true ) ) {
+					throw new \InvalidArgumentException( 'Invalid exclude_initiator value' );
+				}
+			} elseif ( is_array( $args['exclude_initiator'] ) ) {
+				// Multiple initiators - validate each one and filter out empty values.
+				$args['exclude_initiator'] = array_filter( $args['exclude_initiator'] );
+				foreach ( $args['exclude_initiator'] as $initiator ) {
+					if ( ! is_string( $initiator ) || ! in_array( $initiator, Log_Initiators::get_valid_initiators(), true ) ) {
+						throw new \InvalidArgumentException( 'Invalid exclude_initiator value: ' . esc_html( $initiator ) );
+					}
+				}
+			} else {
+				throw new \InvalidArgumentException( 'Invalid exclude_initiator type' );
+			}
+		}
+
+		return $args;
+	}
+
+	/**
+	 * Build the ORDER BY clause for a query.
+	 *
+	 * The column name is never taken from the args directly — it is looked up
+	 * in a map of literal strings, so no caller-supplied text reaches SQL.
+	 * The id column is always appended as a tiebreaker: without it, paging
+	 * over a low-cardinality column like level can repeat a row on two pages.
+	 *
+	 * @param array  $args        Prepared query args.
+	 * @param string $table_alias Table alias to prefix columns with, without the trailing dot.
+	 * @return string Complete ORDER BY clause.
+	 */
+	protected function get_order_by_clause( $args, $table_alias = '' ) {
+		$columns = [
+			'date'    => 'date',
+			'id'      => 'id',
+			'level'   => 'level',
+			'logger'  => 'logger',
+			'message' => 'message',
+		];
+
+		$orderby = $columns[ $args['orderby'] ] ?? 'date';
+		$order   = $args['order'] === 'ASC' ? 'ASC' : 'DESC';
+		$prefix  = $table_alias === '' ? '' : $table_alias . '.';
+
+		// Sorting by id already is the tiebreaker.
+		if ( $orderby === 'id' ) {
+			return sprintf( 'ORDER BY %1$sid %2$s', $prefix, $order );
+		}
+
+		// Level is stored as a varchar, so ordering by the column sorts it
+		// alphabetically: alert, critical, debug, emergency, error, info,
+		// notice, warning. That is not severity order, and "worst first"
+		// would put an emergency below an info. Rank it instead.
+		if ( $orderby === 'level' ) {
+			return sprintf(
+				'ORDER BY %1$s %2$s, %3$sid %2$s',
+				$this->get_level_severity_expression( $prefix ),
+				$order,
+				$prefix
+			);
+		}
+
+		return sprintf(
+			'ORDER BY %1$s%2$s %3$s, %1$sid %3$s',
+			$prefix,
+			$orderby,
+			$order
+		);
+	}
+
+	/**
+	 * Build a CASE expression mapping the level column to its severity rank.
+	 *
+	 * A plain CASE is used rather than MySQL's FIELD(), which SQLite does not
+	 * have. The level strings come from Log_Levels constants, never from
+	 * caller input, but they still go through prepare() so the query carries
+	 * no interpolated literals.
+	 *
+	 * An unrecognised level — a row written by an old version, or by another
+	 * plugin through the logger API — ranks 0 and therefore sorts below
+	 * debug, rather than being dropped from the results.
+	 *
+	 * @param string $prefix Table alias with trailing dot, or an empty string.
+	 * @return string CASE expression, without a trailing comma.
+	 */
+	protected function get_level_severity_expression( $prefix ) {
+		global $wpdb;
+
+		$when_clauses = '';
+
+		foreach ( Log_Levels::get_log_levels_by_severity() as $rank => $level ) {
+			$when_clauses .= $wpdb->prepare( ' WHEN %s THEN %d', $level, $rank + 1 );
+		}
+
+		return sprintf( 'CASE %1$slevel%2$s ELSE 0 END', $prefix, $when_clauses );
+	}
+
+	/**
+	 * Add context to log rows.
+	 * Gets all ids from log rows and then fetches context for those ids
+	 * in a single query.
+	 *
+	 * @param array $log_rows Log rows to append context to.
+	 * @return array Log rows with context added.
+	 */
+	protected function add_contexts_to_log_rows( $log_rows ) {
+		// Bail if no log rows.
+		if ( sizeof( $log_rows ) === 0 ) {
+			return $log_rows;
+		}
+
+		global $wpdb;
+
+		$simple_history = Simple_History::get_instance();
+		$table_contexts = $simple_history->get_contexts_table_name();
+
+		$post_ids = wp_list_pluck( $log_rows, 'id' );
+
+		$sql_context_query = sprintf(
+			'SELECT history_id, `key`, value FROM %2$s WHERE history_id IN (%1$s)',
+			join( ',', $post_ids ),
+			$table_contexts
+		);
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+		$context_results = $wpdb->get_results( $sql_context_query );
+
+		foreach ( $context_results as $context_row ) {
+			if ( ! isset( $log_rows[ $context_row->history_id ]->context ) ) {
+				$log_rows[ $context_row->history_id ]->context = [];
+			}
+
+			$log_rows[ $context_row->history_id ]->context[ $context_row->key ] = $context_row->value;
+		}
+
+		// Move up _message_key from context row to main row as context_message_key.
+		// This is because that's the way it was before SQL was rewritten
+		// to support FULL_GROUP_BY in December 2023.
+		foreach ( $log_rows as $log_row ) {
+			if ( isset( $log_row->context_message_key ) ) {
+				continue;
+			}
+
+			$log_row->context_message_key = null;
+
+			if ( ! isset( $log_row->context['_message_key'] ) ) {
+				continue;
+			}
+
+			$log_row->context_message_key = $log_row->context['_message_key'];
+		}
+
+		return $log_rows;
+	}
+
+	/**
+	 * Get max and min ids for a set of log rows.
+	 *
+	 * @param array $log_rows Log rows.
+	 * @return array<null|int,null|int> Array with max and min id.
+	 */
+	protected function get_max_min_ids( $log_rows ) {
+		/** @var null|int $min_id */
+		$min_id = null;
+
+		/** @var null|int $max_id */
+		$max_id = null;
+
+		// Bail of no log rows.
+		if ( sizeof( $log_rows ) === 0 ) {
+			return [
+				$max_id,
+				$min_id,
+			];
+		}
+
+		global $wpdb;
+
+		$events_table_name = Simple_History::get_instance()->get_events_table_name();
+
+		// Max id is simply the id of the first/most recent row.
+		$max_id = reset( $log_rows )->id;
+
+		// Min id = to find the lowest id we must take occasions into consideration.
+		$last_row = end( $log_rows );
+
+		// phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+		$last_row_occasions_count = (int) $last_row->subsequentOccasions - 1;
+
+		if ( $last_row_occasions_count === 0 ) {
+			// Last row did not have any more occasions, so get min_id directly from the row.
+			$min_id = (int) $last_row->id;
+		} else {
+			// Last row did have occasions, so fetch all occasions, and find id of last one.
+			$sql = sprintf(
+				'
+						SELECT id, date, occasionsID
+						FROM %1$s
+						WHERE id <= %2$d
+						ORDER BY date DESC, id DESC
+						LIMIT %3$d
+					',
+				$events_table_name,
+				$last_row->id,
+				$last_row_occasions_count + 1
+			);
+
+			// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+			$results = $wpdb->get_results( $sql );
+
+			// the last occasion has the id we consider last in this paged result.
+			$min_id = (int) end( $results )->id;
+		}
+
+		return [
+			$max_id,
+			$min_id,
+		];
+	}
+
+	/**
+	 * Find logger and translated message that matches search string.
+	 * The search string in split into words and all words must be found in the translated text.
+	 * The message can contain more text/words than the words in the search string, and partial matches
+	 * are fine.
+	 *
+	 * Swedish examples:
+	 *
+	 * Search phrase "tillägg uppdaterade":
+	 * - Should match logger "SimplePluginLogger", message key "plugin_updated", message "uppdaterade tillägget "{plugin_name}" till {plugin_version} från {plugin_prev_version}"
+	 * - Should match logger "SimplePluginLogger", message key "plugin_bulk_updated", message "uppdaterade tillägget "{plugin_name}" till {plugin_version} från {plugin_prev_version}"
+	 *
+	 * Search phrase "misslyckades logga in":
+	 * - Should match logger "SimpleUserLogger", message key "user_login_failed", message "misslyckades att logga in med användarnamnet "{login}" (felaktigt lösenord angavs)"
+	 * - Should match logger "SimpleUserLogger", message key "user_unknown_login_failed", message "misslyckades att logga in med användarnamnet "{failed_username}" (användarnamnet finns inte)"
+	 *
+	 * @param string $searchstring Search string, for example "misslyckades logga in".
+	 * @return array<int,array> Array with logger and message that matched search string.
+	 */
+	protected function match_logger_messages_with_search( $searchstring ) {
+		$Simple_History = Simple_History::get_instance();
+
+		$loggers_user_can_read = $Simple_History->get_loggers_that_user_can_read();
+
+		/** @var array<int,array<int,array>> Array with found logger, message key, translated message, and untranslated message. */
+		$found_matches = [];
+
+		$words = $this->get_sanitized_search_words( $searchstring );
+
+		if ( empty( $words ) ) {
+			return [];
+		}
+
+		// Lowercase for case-insensitive comparison against translated templates.
+		$words = array_map( 'strtolower', $words );
+
+		foreach ( $loggers_user_can_read as $one_logger ) {
+			/** @var \Simple_History\Loggers\Logger $logger_instance */
+			$logger_instance = $one_logger['instance'];
+			$one_logger_slug = $logger_instance->get_slug();
+			$one_logger_name = $one_logger['name'];
+
+			/** @var array<string,array> */
+			$logger_instance_messages = $logger_instance->get_messages();
+
+			foreach ( $logger_instance_messages as $one_message_key => $one_message ) {
+				$translated_text = strtolower( $one_message['translated_text'] );
+
+				// Check if every word in search string exists in translated text.
+				$all_words_found = true;
+
+				foreach ( $words as $one_word ) {
+					if ( strpos( $translated_text, $one_word ) === false ) {
+						$all_words_found = false;
+						break;
+					}
+				}
+
+				if ( ! $all_words_found ) {
+					continue;
+				}
+
+				$found_matches[] = [
+					'logger_name'       => $one_logger_name,
+					'logger_slug'       => $one_logger_slug,
+					'message_key'       => $one_message_key,
+					'translated_text'   => $translated_text,
+					'untranslated_text' => strtolower( $one_message['untranslated_text'] ),
+				];
+			}
+		}
+
+		return $found_matches;
+	}
+
+	/**
+	 * Get inner where clause as array where each item in the array is a where clause statement, without the "WHERE" keyword or "AND" keyword.
+	 *
+	 * This function is used by both MySQL and SQLite.
+	 *
+	 * Example of array contents:
+	 *
+	 * Array
+	 * (
+	 *  [0] => logger IN ('AvailableUpdatesLogger', 'FileEditsLogger', 'Plugin_ACF', 'Plugin_BeaverBuilder', 'Plugin_DuplicatePost', 'Plugin_LimitLoginAttempts', 'Plugin_Redirection', 'PluginEnableMediaReplaceLogger', 'PluginUserSwitchingLogger', 'PluginWPCrontrolLogger', 'SH_Jetpack_Logger', 'SH_Privacy_Logger', 'SH_Translations_Logger', 'SimpleCategoriesLogger', 'SimpleCommentsLogger', 'SimpleCoreUpdatesLogger', 'SimpleExportLogger', 'SimpleLogger', 'SimpleMediaLogger', 'SimpleMenuLogger', 'SimpleOptionsLogger', 'SimplePluginLogger', 'SimplePostLogger', 'SimpleThemeLogger', 'SimpleUserLogger', 'SimpleHistoryLogger', 'WPMailLogger', 'WPHTTPRequestsLogger', 'WPCronLogger', 'WooCommerceLogger')
+	 *  [1] => date >= DATE(NOW() - INTERVAL 30 DAY)
+	 * )
+	 *
+	 * @param array $args Query arguments, as passed to query().
+	 * @return array<string> Where clauses.
+	 * @throws \InvalidArgumentException If a months value is not in valid Y-m format.
+	 */
+	protected function get_inner_where( $args ) {
+		global $wpdb;
+
+		$simple_history      = Simple_History::get_instance();
+		$contexts_table_name = $simple_history->get_contexts_table_name();
+
+		$inner_where = [];
+
+		// Only include loggers that the current user can view.
+		// Skipped when `ignore_logger_capabilities` is set — used by the privacy
+		// export/erasure so a data subject's records are complete regardless of
+		// which user (or cron context) processes the request.
+		// TODO: this causes error if user has no access to any logger at all.
+		if ( empty( $args['ignore_logger_capabilities'] ) ) {
+			$sql_loggers_user_can_view = $simple_history->get_loggers_that_user_can_read( get_current_user_id(), 'sql' );
+			$inner_where[]             = "logger IN {$sql_loggers_user_can_view}";
+		}
+
+		// Add post__in where.
+		if ( isset( $args['post__in'] ) && sizeof( $args['post__in'] ) > 0 ) {
+			$inner_where[] = sprintf( 'id IN (%1$s)', implode( ',', $args['post__in'] ) );
+		}
+
+		// If max_id_first_page is then then only include rows
+		// with id equal to or earlier than this, i.e. older than this.
+		if ( isset( $args['max_id_first_page'] ) ) {
+			$inner_where[] = sprintf(
+				'id <= %1$d',
+				$args['max_id_first_page']
+			);
+		}
+
+		// Add where clause for since_id and since_date.
+		// When both are provided, we want events that would appear ABOVE the current view.
+		// With ORDER BY date DESC, id DESC, that means:
+		// - Events with date > since_date (newer date).
+		// - OR events with date = since_date AND id > since_id (same date but higher ID).
+		if ( isset( $args['since_date'] ) && isset( $args['since_id'] ) ) {
+			$inner_where[] = $wpdb->prepare(
+				'(date > %s OR (date = %s AND id > %d))',
+				$args['since_date'],
+				$args['since_date'],
+				$args['since_id']
+			);
+		} elseif ( isset( $args['since_id'] ) ) {
+			// Fallback to ID-only for backward compatibility
+			// (though this is less accurate with date ordering).
+			$inner_where[] = sprintf(
+				'id > %1$d',
+				(int) $args['since_id'],
+			);
+		}
+
+		// Append date where clause.
+		// If date_from is set it is a timestamp.
+		if ( ! empty( $args['date_from'] ) ) {
+			$inner_where[] = sprintf( 'date >= \'%1$s\'', gmdate( 'Y-m-d H:i:s', $args['date_from'] ) );
+		}
+
+		// Date to.
+		// If date_to is set it is a timestamp.
+		if ( ! empty( $args['date_to'] ) ) {
+			$inner_where[] = sprintf( 'date <= \'%1$s\'', gmdate( 'Y-m-d H:i:s', $args['date_to'] ) );
+		}
+
+		// If "months" they translate to $args["months"] because we already have support for that
+		// can't use months and dates and the same time.
+		if ( ! empty( $args['dates'] ) ) {
+			if ( is_array( $args['dates'] ) ) {
+				$arr_dates = $args['dates'];
+			} else {
+				$arr_dates = explode( ',', $args['dates'] );
+			}
+
+			/*
+				$arr_dates can be a month:
+
+				Array
+				(
+					[0] => month:2021-11
+				)
+
+				$arr_dates can be a number of days:
+				Array
+				(
+					[0] => lastdays:7
+				)
+
+				$arr_dates can be allDates
+				Array
+				(
+					[0] => allDates
+				)
+			*/
+
+			$args['months']    = [];
+			$args['lastdays']  = 0;
+			$args['yesterday'] = false;
+
+			foreach ( $arr_dates as $one_date ) {
+				if ( strpos( $one_date, 'month:' ) === 0 ) {
+					// If begins with "month:" then strip string and keep only month numbers.
+					$args['months'][] = substr( $one_date, strlen( 'month:' ) );
+					// If begins with "lastdays:" then strip string and keep only number of days.
+				} elseif ( strpos( $one_date, 'lastdays:' ) === 0 ) {
+					// Only keep largest lastdays value.
+					$args['lastdays'] = max( $args['lastdays'], substr( $one_date, strlen( 'lastdays:' ) ) );
+				} elseif ( $one_date === 'yesterday' ) {
+					$args['yesterday'] = true;
+				}
+			}
+		}
+
+		// Add where clause for "lastdays", as int.
+		// Uses Date_Helper to ensure WordPress timezone is respected.
+		if ( ! empty( $args['lastdays'] ) ) {
+			// Validate lastdays is a positive integer.
+			$lastdays = (int) $args['lastdays'];
+			if ( $lastdays > 0 ) {
+				$timestamp     = Date_Helper::get_last_n_days_start_timestamp( $lastdays );
+				$inner_where[] = sprintf( 'date >= \'%1$s\'', gmdate( 'Y-m-d H:i:s', $timestamp ) );
+			}
+		}
+
+		// Add where clause for "yesterday".
+		// Uses Date_Helper which respects WordPress timezone.
+		if ( ! empty( $args['yesterday'] ) ) {
+			$range         = Date_Helper::get_last_n_complete_days_range( 1 );
+			$inner_where[] = sprintf(
+				'(date >= \'%1$s\' AND date <= \'%2$s\')',
+				gmdate( 'Y-m-d H:i:s', $range['from'] ),
+				gmdate( 'Y-m-d H:i:s', $range['to'] )
+			);
+		}
+
+		// months, in format "Y-m".
+		if ( ! empty( $args['months'] ) ) {
+			if ( is_array( $args['months'] ) ) {
+				$arr_months = $args['months'];
+			} else {
+				$arr_months = explode( ',', $args['months'] );
+			}
+
+			$sql_month_clauses = [];
+
+			foreach ( $arr_months as $one_month ) {
+				$one_month = is_string( $one_month ) ? trim( $one_month ) : $one_month;
+
+				// Blank entries mean "no filter" and are skipped, matching how
+				// empty date_from/date_to are treated.
+				if ( $one_month === '' || $one_month === null ) {
+					continue;
+				}
+
+				// Anything else must be a valid "Y-m" value. A malformed value
+				// like "banana" would otherwise produce a nonsense date filter
+				// or an uncaught exception from DateTimeImmutable.
+				if ( ! is_string( $one_month ) || ! $this->is_valid_date_format( $one_month, 'Y-m' ) ) {
+					throw new \InvalidArgumentException( 'Invalid months value. Use Y-m format (e.g., 2024-08)' );
+				}
+
+				// Beginning of month in WordPress timezone.
+				// For "2014-08", this is 2014-08-01 00:00:00 in WordPress timezone.
+				$date_month_beginning_obj = new \DateTimeImmutable( $one_month . '-01 00:00:00', wp_timezone() );
+				$date_month_beginning     = $date_month_beginning_obj->getTimestamp();
+
+				// End of month in WordPress timezone.
+				// Add 1 month to get the start of the next month, then subtract 1 second to get end of current month.
+				// For "2014-08", this is 2014-08-31 23:59:59 in WordPress timezone.
+				$date_month_end_obj = $date_month_beginning_obj->modify( '+1 month' )->modify( '-1 second' );
+				$date_month_end     = $date_month_end_obj->getTimestamp();
+
+				$sql_month_clauses[] = sprintf(
+					'( date >= "%1$s" AND date <= "%2$s" )',
+					gmdate( 'Y-m-d H:i:s', $date_month_beginning ), // 1
+					gmdate( 'Y-m-d H:i:s', $date_month_end ) // 2
+				);
+			}
+
+			// Only add the clause when at least one valid month survived —
+			// an empty group "()" would be a SQL syntax error.
+			if ( $sql_month_clauses !== [] ) {
+				$inner_where[] = '( ' . implode( ' OR ', $sql_month_clauses ) . ' )';
+			}
+		}
+
+		// Search.
+		$inner_where = $this->add_search_to_inner_where_query( $inner_where, $args );
+
+		// "loglevels", array with loglevels.
+		// e.g. info, debug, and so on.
+		if ( ! empty( $args['loglevels'] ) ) {
+			// Create placeholders for prepared statement.
+			$placeholders  = implode( ', ', array_fill( 0, count( $args['loglevels'] ), '%s' ) );
+			$inner_where[] = $wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Dynamic placeholders in $placeholders variable matched with spread operator
+				"level IN ({$placeholders})",
+				...$args['loglevels']
+			);
+		}
+
+		// loggers, comma separated or array.
+		// Example REST API call: /wp-json/simple-history/v1/events?per_page=10&page=1&loggers=SimpleCommentsLogger,SimpleCoreUpdatesLogger.
+		if ( ! empty( $args['loggers'] ) ) {
+			// Create placeholders for prepared statement.
+			$placeholders  = implode( ', ', array_fill( 0, count( $args['loggers'] ), '%s' ) );
+			$inner_where[] = $wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Dynamic placeholders in $placeholders variable matched with spread operator
+				"logger IN ({$placeholders})",
+				...$args['loggers']
+			);
+		}
+
+		// "messages" - filter by logger slug + message key pairs.
+		if ( ! empty( $args['messages'] ) ) {
+			$sql_messages_where_parts = [];
+
+			foreach ( $args['messages'] as $logger_slug => $logger_messages ) {
+				$placeholders = implode( ', ', array_fill( 0, count( $logger_messages ), '%s' ) );
+
+				// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Dynamic placeholders in $placeholders variable matched with spread operator
+				$sql_messages_where_parts[] = $wpdb->prepare(
+					'(logger = %s AND id IN ( SELECT history_id FROM ' . $contexts_table_name . ' AS c WHERE c.key = \'_message_key\' AND c.value IN (' . $placeholders . ') ))', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+					$logger_slug,
+					...$logger_messages
+				);
+			}
+
+			$inner_where[] = '(' . implode( ' OR ', $sql_messages_where_parts ) . ')';
+		}
+
+		// Add where for a single user ID.
+		if ( isset( $args['user'] ) ) {
+			$inner_where[] = $wpdb->prepare(
+				'id IN ( SELECT history_id FROM ' . $contexts_table_name . ' AS c WHERE c.key = %s AND c.value = %s )', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+				'_user_id',
+				$args['user']
+			);
+		}
+
+		// Users, array with user ids.
+		if ( isset( $args['users'] ) ) {
+			// Create placeholders for prepared statement.
+			$placeholders = implode( ', ', array_fill( 0, count( $args['users'] ), '%s' ) );
+
+			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Dynamic placeholders in $placeholders variable matched with spread operator
+			$inner_where[] = $wpdb->prepare(
+				'id IN ( SELECT history_id FROM ' . $contexts_table_name . ' AS c WHERE c.key = %s AND c.value IN (' . $placeholders . ') )', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+				'_user_id',
+				...$args['users']
+			);
+		}
+
+		// If only_sticky is true, only return sticky events.
+		if ( ! empty( $args['only_sticky'] ) ) {
+			$inner_where[] = sprintf(
+				'id IN ( SELECT history_id FROM %1$s AS c WHERE c.key = \'_sticky\' )',
+				$contexts_table_name
+			);
+		}
+
+		// Add where clause for initiator filter.
+		if ( isset( $args['initiator'] ) ) {
+			if ( is_string( $args['initiator'] ) ) {
+				// Single initiator.
+				$inner_where[] = sprintf(
+					'initiator = \'%s\'',
+					esc_sql( $args['initiator'] )
+				);
+			} elseif ( is_array( $args['initiator'] ) && ! empty( $args['initiator'] ) ) {
+				// Multiple initiators - use IN clause.
+				$escaped_initiators = array_map( 'esc_sql', $args['initiator'] );
+				$inner_where[]      = sprintf(
+					'initiator IN (\'%s\')',
+					implode( '\',\'', $escaped_initiators )
+				);
+			}
+		}
+
+		// Add where clause for IP address filtering.
+		// Uses LIKE to support anonymized IPs where the last octet is replaced with "x".
+		// For example, "192.168.1.x" will match by searching for "192.168.1.%".
+		//
+		// Matches every context key that can hold an address, not just the one the
+		// web server saw. Behind a proxy or load balancer _server_remote_addr is the
+		// same on every event and the visitor's real address lives in a forwarding
+		// header, so matching only the former would make the filter useless on
+		// exactly the sites that need it most. The UI shows all of an event's
+		// addresses, so all of them are filterable.
+		if ( ! empty( $args['ip_address'] ) && ! Helpers::current_user_can_view_ip_addresses() ) {
+			// Filtering on an address is reading it, one guess at a time. Match
+			// nothing rather than ignoring the filter, so the result does not
+			// pretend to be filtered.
+			$inner_where[] = '1 = 0';
+		} elseif ( ! empty( $args['ip_address'] ) ) {
+			$ip_address = $args['ip_address'];
+
+			// Replace ".x" octets (anonymized IP) with ".%" for LIKE matching.
+			$ip_like = preg_replace( '/\.x\b/', '.%', $ip_address );
+
+			// Any of the IP-holding keys will do. esc_like() is required because "_"
+			// is a single character wildcard in LIKE and these keys are full of them.
+			$key_where = array();
+
+			foreach ( Helpers::get_ip_address_context_key_prefixes() as $key_prefix ) {
+				$key_where[] = $wpdb->prepare( 'c.key LIKE %s', $wpdb->esc_like( $key_prefix ) . '%' );
+			}
+
+			$key_where_sql = '( ' . implode( ' OR ', $key_where ) . ' )';
+
+			// If the IP doesn't end with a wildcard, use exact match.
+			if ( str_contains( $ip_like, '%' ) ) {
+				$value_where_sql = $wpdb->prepare( 'c.value LIKE %s', $ip_like );
+			} else {
+				$value_where_sql = $wpdb->prepare( 'c.value = %s', $ip_address );
+			}
+
+			// Value before keys, deliberately. Once the contexts table is large enough
+			// that the key index stops being selective — every event carries an IP, so
+			// that happens early — the planner scans, and then the address comparison
+			// wants to run before the key patterns. Measured on 400k context rows:
+			// keys first 126ms, value first 48ms, versus 50ms for the old single-key
+			// query. Ordering is what keeps this change free.
+			$inner_where[] = 'id IN ( SELECT history_id FROM ' . $contexts_table_name . ' AS c WHERE ' . $value_where_sql . ' AND ' . $key_where_sql . ' )'; // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+		}
+
+		// Add where clause for context filters.
+		if ( ! empty( $args['context_filters'] ) && is_array( $args['context_filters'] ) ) {
+			$unsearchable_keys     = self::get_unsearchable_context_keys();
+			$unsearchable_prefixes = self::get_unsearchable_context_key_prefixes();
+
+			// esc_like() because "_" is a single character wildcard in LIKE.
+			$unsearchable_patterns = array_map(
+				static fn( $prefix ) => $wpdb->esc_like( $prefix ) . '%',
+				$unsearchable_prefixes
+			);
+
+			$unsearchable_keys_sql = ' AND c.key NOT IN ( ' . implode( ', ', array_fill( 0, count( $unsearchable_keys ), '%s' ) ) . ' )'
+				. str_repeat( ' AND c.key NOT LIKE %s', count( $unsearchable_patterns ) );
+
+			foreach ( $args['context_filters'] as $context_key => $context_value ) {
+				// Filtering on a value is reading it, one guess at a time.
+				if ( in_array( (string) $context_key, $unsearchable_keys, true ) ) {
+					continue;
+				}
+
+				foreach ( $unsearchable_prefixes as $unsearchable_prefix ) {
+					if ( str_starts_with( (string) $context_key, $unsearchable_prefix ) ) {
+						continue 2;
+					}
+				}
+
+				// The checks above compare exactly, but `c.key = %s` uses the
+				// table's collation, which usually ignores case and trailing
+				// spaces: "_SERVER_REMOTE_ADDR" gets past them and still
+				// matches. So the database excludes the same keys itself, with
+				// the same collation, and such a filter matches nothing.
+				// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Placeholders in $unsearchable_keys_sql match the merged array.
+				$inner_where[] = $wpdb->prepare(
+					'id IN ( SELECT history_id FROM ' . $contexts_table_name . ' AS c WHERE c.key = %s AND c.value = %s' . $unsearchable_keys_sql . ' )',
+					array_merge( [ $context_key, $context_value ], $unsearchable_keys, $unsearchable_patterns )
+				);
+				// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+			}
+		}
+
+		// Show only events that carry an AI agent attribution.
+		if ( ! empty( $args['ai_only'] ) ) {
+			$inner_where[] = $wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				"id IN ( SELECT history_id FROM {$contexts_table_name} AS c WHERE c.`key` = %s )",
+				\Simple_History\Services\AI_Initiator_Detector::CONTEXT_KEY_AGENT
+			);
+		}
+
+		// Metadata search: plain text search across all context values.
+		// Unlike the main search which only searches visible message text,
+		// this searches ALL context values (for advanced users who need to
+		// find events by IP address, email, etc.).
+		//
+		// All of them except the ones from
+		// self::get_unsearchable_context_keys(), which are context rows the
+		// REST API deliberately does not hand out whole. Searching a value
+		// is reading it: a reader who can ask "does any event contain this
+		// phrase" and get a yes can recover the phrase itself, one guess at
+		// a time, from a field the API took care to withhold.
+		if ( ! empty( $args['metadata_search'] ) ) {
+			$metadata_words = $this->get_sanitized_search_words( $args['metadata_search'] );
+			$excluded_keys  = self::get_unsearchable_context_keys();
+
+			$excluded_keys_placeholders = implode(
+				', ',
+				array_fill( 0, count( $excluded_keys ), '%s' )
+			);
+
+			// esc_like() because "_" is a single character wildcard in LIKE.
+			$excluded_prefix_patterns = array_map(
+				static fn( $prefix ) => $wpdb->esc_like( $prefix ) . '%',
+				self::get_unsearchable_context_key_prefixes()
+			);
+
+			$excluded_prefixes_sql = str_repeat( ' AND c.`key` NOT LIKE %s', count( $excluded_prefix_patterns ) );
+
+			foreach ( $metadata_words as $word ) {
+				// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$inner_where[] = $wpdb->prepare(
+					"id IN ( SELECT history_id FROM {$contexts_table_name} AS c WHERE c.value LIKE %s AND c.`key` NOT IN ( {$excluded_keys_placeholders} ){$excluded_prefixes_sql} )",
+					array_merge(
+						[ '%' . $wpdb->esc_like( $word ) . '%' ],
+						$excluded_keys,
+						$excluded_prefix_patterns
+					)
+				);
+				// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			}
+		}
+
+		// Exclusion filters - add NOT IN clauses to hide events matching these criteria.
+		// Exclusions are processed after inclusions so they can filter out included items.
+		// When both inclusion and exclusion filters are specified, the SQL AND logic ensures exclusion takes precedence.
+		// "exclude_search" - text to exclude from search results.
+		$inner_where = $this->add_exclude_search_to_inner_where_query( $inner_where, $args );
+
+		// "exclude_loglevels" - array with log levels to exclude.
+		if ( ! empty( $args['exclude_loglevels'] ) ) {
+			// Create placeholders for prepared statement.
+			$placeholders  = implode( ', ', array_fill( 0, count( $args['exclude_loglevels'] ), '%s' ) );
+			$inner_where[] = $wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Dynamic placeholders in $placeholders variable matched with spread operator
+				"level NOT IN ({$placeholders})",
+				...$args['exclude_loglevels']
+			);
+		}
+
+		// "exclude_loggers" - array with logger slugs to exclude.
+		if ( ! empty( $args['exclude_loggers'] ) ) {
+			// Create placeholders for prepared statement.
+			$placeholders  = implode( ', ', array_fill( 0, count( $args['exclude_loggers'] ), '%s' ) );
+			$inner_where[] = $wpdb->prepare(
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- Dynamic placeholders in $placeholders variable matched with spread operator
+				"logger NOT IN ({$placeholders})",
+				...$args['exclude_loggers']
+			);
+		}
+
+		// "exclude_messages" - array with logger:message pairs to exclude.
+		if ( ! empty( $args['exclude_messages'] ) && is_array( $args['exclude_messages'] ) ) {
+			$sql_exclude_messages_parts = [];
+
+			foreach ( $args['exclude_messages'] as $exclude_logger_slug => $exclude_logger_messages ) {
+				foreach ( $exclude_logger_messages as $one_exclude_message_key ) {
+					$sql_exclude_messages_parts[] = $wpdb->prepare(
+						'NOT ( logger = %s AND id IN ( SELECT history_id FROM ' . $contexts_table_name . ' AS c WHERE c.key = \'_message_key\' AND c.value = %s ) )', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+						$exclude_logger_slug,
+						$one_exclude_message_key
+					);
+				}
+			}
+
+			if ( ! empty( $sql_exclude_messages_parts ) ) {
+				$inner_where[] = implode( ' AND ', $sql_exclude_messages_parts );
+			}
+		}
+
+		// "exclude_user" - single user ID to exclude.
+		if ( isset( $args['exclude_user'] ) ) {
+			$inner_where[] = $wpdb->prepare(
+				'id NOT IN ( SELECT history_id FROM ' . $contexts_table_name . ' AS c WHERE c.key = %s AND c.value = %s )', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+				'_user_id',
+				$args['exclude_user']
+			);
+		}
+
+		// "exclude_users" - array with user IDs to exclude.
+		if ( isset( $args['exclude_users'] ) && ! empty( $args['exclude_users'] ) ) {
+			// Create placeholders for prepared statement.
+			$placeholders = implode( ', ', array_fill( 0, count( $args['exclude_users'] ), '%s' ) );
+			// phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber -- Dynamic placeholders in $placeholders variable matched with spread operator
+			$inner_where[] = $wpdb->prepare(
+				'id NOT IN ( SELECT history_id FROM ' . $contexts_table_name . ' AS c WHERE c.key = %s AND c.value IN (' . $placeholders . ') )', // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+				'_user_id',
+				...$args['exclude_users']
+			);
+		}
+
+		// "exclude_initiator" - initiator(s) to exclude.
+		if ( isset( $args['exclude_initiator'] ) ) {
+			if ( is_string( $args['exclude_initiator'] ) ) {
+				// Single initiator.
+				$inner_where[] = sprintf(
+					'initiator != \'%s\'',
+					esc_sql( $args['exclude_initiator'] )
+				);
+			} elseif ( is_array( $args['exclude_initiator'] ) && ! empty( $args['exclude_initiator'] ) ) {
+				// Multiple initiators - use NOT IN clause.
+				$escaped_initiators = array_map( 'esc_sql', $args['exclude_initiator'] );
+				$inner_where[]      = sprintf(
+					'initiator NOT IN (\'%s\')',
+					implode( '\',\'', $escaped_initiators )
+				);
+			}
+		}
+
+		/**
+		 * Filter the default boxes to output in the sidebar
+		 *
+		 * @since 4.17.0
+		 *
+		 * @param array $inner_where The inner where array.
+		 * @param array $args The arguments passed to the query.
+		 */
+		$inner_where = apply_filters( 'simple_history/log_query_inner_where_array', $inner_where, $args );
+
+		return $inner_where;
+	}
+
+	/**
+	 * Get outer where clause.
+	 *
+	 * @param array $args Arguments.
+	 * @return array<string> Where clauses.
+	 */
+	protected function get_outer_where( $args ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found
+		return [];
+	}
+
+	/**
+	 * Get db engine in use.
+	 * Default is "mysql", which supports both MySQL and MariaDB.
+	 * Can also return "sqlite", which means that plugin
+	 * https://wordpress.org/plugins/sqlite-database-integration/ is in use,
+	 * and we need to use SQLite specific SQL at some places.
+	 *
+	 * @return string "mysql" or "sqlite"
+	 */
+	public static function get_db_engine() {
+		return defined( 'DB_ENGINE' ) && constant( 'DB_ENGINE' ) === 'sqlite' ? 'sqlite' : 'mysql';
+	}
+
+	/**
+	 * Add search queries to inner where array.
+	 *
+	 * @param array $inner_where Existing inner where query.
+	 * @param array $args Arguments passed to API.
+	 * @return array $inner_where, possibly modified.
+	 */
+	private function add_search_to_inner_where_query( $inner_where, $args ) {
+		if ( ! isset( $args['search'] ) || ! is_string( $args['search'] ) || $args['search'] === '' ) {
+			return $inner_where;
+		}
+
+		global $wpdb;
+
+		$contexts_table_name = Simple_History::get_instance()->get_contexts_table_name();
+
+		$arr_search_words = $this->get_sanitized_search_words( $args['search'] );
+
+		if ( empty( $arr_search_words ) ) {
+			return $inner_where;
+		}
+
+		// Build per-word conditions: each word must match in at least one source
+		// (column, context, or translated template). Words are AND'd so all must match,
+		// but each word can match in a different source — e.g. "api" in the message
+		// column and "400" in a context value.
+		$per_word_conditions = $this->build_per_word_search_conditions( $arr_search_words, $contexts_table_name );
+
+		$top_conditions = [];
+
+		if ( ! empty( $per_word_conditions ) ) {
+			$top_conditions[] = '( ' . implode( "\n AND ", $per_word_conditions ) . ' )';
+		}
+
+		// Translated logger messages: match the full search string against translated
+		// message templates, then look up by _message_key. This is a separate OR path
+		// because the match is on the whole template, not per-word.
+		$logger_messages_with_search_string_matches = $this->match_logger_messages_with_search( $args['search'] );
+		foreach ( $logger_messages_with_search_string_matches as $one_logger_message ) {
+			$top_conditions[] = $wpdb->prepare(
+				"( logger = %s AND id IN ( SELECT history_id FROM {$contexts_table_name} AS c WHERE c.key = '_message_key' AND c.value = %s ) )", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$one_logger_message['logger_slug'],
+				$one_logger_message['message_key']
+			);
+		}
+
+		if ( ! empty( $top_conditions ) ) {
+			$inner_where[] = "\n(\n " . implode( "\n OR ", $top_conditions ) . " \n)";
+		}
+
+		return $inner_where;
+	}
+
+	/**
+	 * Add exclude search queries to inner where array.
+	 *
+	 * This method builds WHERE conditions to exclude events containing the specified search terms.
+	 * It mirrors the logic of add_search_to_inner_where_query() but uses NOT logic instead.
+	 *
+	 * @param array $inner_where Existing inner where query.
+	 * @param array $args Arguments passed to API.
+	 * @return array $inner_where, possibly modified.
+	 */
+	private function add_exclude_search_to_inner_where_query( $inner_where, $args ) {
+		if ( ! isset( $args['exclude_search'] ) || ! is_string( $args['exclude_search'] ) || $args['exclude_search'] === '' ) {
+			return $inner_where;
+		}
+
+		global $wpdb;
+
+		$contexts_table_name = Simple_History::get_instance()->get_contexts_table_name();
+
+		$arr_exclude_words = $this->get_sanitized_search_words( $args['exclude_search'] );
+
+		if ( empty( $arr_exclude_words ) ) {
+			return $inner_where;
+		}
+
+		// Same per-word structure as search, but wrapped in NOT.
+		$per_word_conditions = $this->build_per_word_search_conditions( $arr_exclude_words, $contexts_table_name );
+
+		$top_conditions = [];
+
+		if ( ! empty( $per_word_conditions ) ) {
+			$top_conditions[] = '( ' . implode( "\n AND ", $per_word_conditions ) . ' )';
+		}
+
+		// Exclude translated logger messages.
+		$logger_messages_with_exclude_string_matches = $this->match_logger_messages_with_search( $args['exclude_search'] );
+		foreach ( $logger_messages_with_exclude_string_matches as $one_logger_message ) {
+			$top_conditions[] = $wpdb->prepare(
+				"( logger = %s AND id IN ( SELECT history_id FROM {$contexts_table_name} AS c WHERE c.key = '_message_key' AND c.value = %s ) )", // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$one_logger_message['logger_slug'],
+				$one_logger_message['message_key']
+			);
+		}
+
+		if ( ! empty( $top_conditions ) ) {
+			// Wrap everything in NOT to exclude matching events.
+			$inner_where[] = "\nNOT (\n " . implode( "\n OR ", $top_conditions ) . " \n)";
+		}
+
+		return $inner_where;
+	}
+
+	/**
+	 * Build per-word search conditions.
+	 *
+	 * Each word gets its own OR group of all possible match sources
+	 * (columns, context values, etc.). Words are meant to be AND'd
+	 * together so all must match, but each can match in a different source.
+	 *
+	 * Example for "api request 400":
+	 *   (message LIKE '%api%' OR context_has_api)
+	 *   AND (message LIKE '%request%' OR context_has_request)
+	 *   AND (message LIKE '%400%' OR context_has_400)
+	 *
+	 * @param array<string> $search_words Array of search words.
+	 * @param string        $contexts_table_name Full table name for contexts.
+	 * @return array<string> Array of per-word SQL condition strings.
+	 */
+	private function build_per_word_search_conditions( $search_words, $contexts_table_name ) {
+		global $wpdb;
+
+		$search_columns = [ 'message', 'logger', 'level' ];
+
+		// Pre-compute context search keys for scoped search.
+		$placeholder_keys = $this->get_searchable_context_keys();
+		$fallback_loggers = $this->get_loggers_without_messages();
+		$fallback_keys    = ! empty( $fallback_loggers )
+			? $this->get_fallback_logger_context_keys( $fallback_loggers )
+			: [];
+
+		$per_word_conditions = [];
+
+		foreach ( $search_words as $word ) {
+			$word_sources = [];
+
+			// Column matches: message, logger, level.
+			foreach ( $search_columns as $column ) {
+				// Column name is from the hardcoded $search_columns array, safe to interpolate.
+				// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+				$word_sources[] = $wpdb->prepare( "{$column} LIKE %s", '%' . $wpdb->esc_like( $word ) . '%' );
+			}
+
+			// Scoped context: only search placeholder keys from registered loggers.
+			if ( ! empty( $placeholder_keys ) ) {
+				$key_ph = implode( ', ', array_fill( 0, count( $placeholder_keys ), '%s' ) );
+
+				// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+				$word_sources[] = $wpdb->prepare(
+					"id IN ( SELECT c.history_id FROM {$contexts_table_name} AS c WHERE c.key IN ( {$key_ph} ) AND c.value LIKE %s )",
+					...array_merge( $placeholder_keys, [ '%' . $wpdb->esc_like( $word ) . '%' ] )
+				);
+				// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+			}
+
+			// Fallback context: placeholder keys from fallback loggers' DB templates.
+			if ( ! empty( $fallback_loggers ) && ! empty( $fallback_keys ) ) {
+				$key_ph    = implode( ', ', array_fill( 0, count( $fallback_keys ), '%s' ) );
+				$logger_ph = implode( ', ', array_fill( 0, count( $fallback_loggers ), '%s' ) );
+
+				// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+				$context_subquery = $wpdb->prepare(
+					"id IN ( SELECT c.history_id FROM {$contexts_table_name} AS c WHERE c.key IN ( {$key_ph} ) AND c.value LIKE %s )",
+					...array_merge( $fallback_keys, [ '%' . $wpdb->esc_like( $word ) . '%' ] )
+				);
+				// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+
+				// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+				$logger_condition = $wpdb->prepare(
+					"logger IN ( {$logger_ph} )",
+					...$fallback_loggers
+				);
+				// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+
+				$word_sources[] = "( {$logger_condition} AND {$context_subquery} )";
+			}
+
+			$per_word_conditions[] = "(\n   " . implode( "\n   OR ", $word_sources ) . "\n  )";
+		}
+
+		return $per_word_conditions;
+	}
+
+	/**
+	 * Split a search string into sanitized words.
+	 *
+	 * Splits on whitespace and commas, removes empty strings,
+	 * and caps at 10 words to prevent excessive subqueries.
+	 *
+	 * @param string $search_string The search string to split.
+	 * @return array<string> Array of non-empty search words.
+	 */
+	private function get_sanitized_search_words( $search_string ) {
+		$words = preg_split( '/[\s,]+/', $search_string );
+
+		// Remove empty strings that preg_split can produce.
+		$words = array_filter( $words, 'strlen' );
+
+		// Cap word count to prevent excessive subqueries.
+		$max_words = 10;
+		if ( count( $words ) > $max_words ) {
+			$words = array_slice( $words, 0, $max_words );
+		}
+
+		return array_values( $words );
+	}
+
+	/**
+	 * Get the set of context keys that are used as {placeholders} in logger message templates.
+	 *
+	 * Extracts placeholder names from all registered logger messages.
+	 * For example, `Activated plugin "{plugin_name}"` yields `plugin_name`.
+	 *
+	 * Uses a static variable to cache the result within a single request,
+	 * since both search and exclude_search may call this method.
+	 *
+	 * @return array<string> Unique array of context key names.
+	 */
+	private function get_searchable_context_keys() {
+		// Cache keyed on user ID because get_loggers_that_user_can_read()
+		// is user-specific. Prevents stale results in tests and WP-CLI.
+		static $cache = [];
+
+		$user_id = get_current_user_id();
+
+		if ( isset( $cache[ $user_id ] ) ) {
+			return $cache[ $user_id ];
+		}
+
+		$simple_history        = Simple_History::get_instance();
+		$loggers_user_can_read = $simple_history->get_loggers_that_user_can_read();
+		$keys                  = [];
+
+		foreach ( $loggers_user_can_read as $one_logger ) {
+			/** @var \Simple_History\Loggers\Logger $logger_instance */
+			$logger_instance = $one_logger['instance'];
+			$messages        = $logger_instance->get_messages();
+
+			foreach ( $messages as $message_data ) {
+				$template = $message_data['untranslated_text'] ?? '';
+
+				if ( ! preg_match_all( '/\{(\w+)\}/', $template, $matches ) ) {
+					continue;
+				}
+
+				$keys = array_merge( $keys, $matches[1] );
+			}
+		}
+
+		$cache[ $user_id ] = array_unique( $keys );
+
+		return $cache[ $user_id ];
+	}
+
+	/**
+	 * Get searchable context keys for fallback loggers by inspecting
+	 * actual message templates stored in the database.
+	 *
+	 * Fallback loggers (SimpleLogger, etc.) don't register their messages
+	 * in PHP, so we query their distinct message templates from the events
+	 * table and extract {placeholder} names.
+	 *
+	 * Uses a static variable to cache the result within a single request.
+	 *
+	 * @param array<string> $logger_slugs Array of fallback logger slugs.
+	 * @return array<string> Unique array of context key names.
+	 */
+	private function get_fallback_logger_context_keys( $logger_slugs ) {
+		// Cache keyed on the sorted slug set. Both search and exclude_search
+		// callers pass the same get_loggers_without_messages() result, so this
+		// typically caches on the first call and returns the same result.
+		static $cache = [];
+
+		$sorted_slugs = $logger_slugs;
+		sort( $sorted_slugs );
+		$cache_key = implode( ',', $sorted_slugs );
+
+		if ( isset( $cache[ $cache_key ] ) ) {
+			return $cache[ $cache_key ];
+		}
+
+		if ( empty( $logger_slugs ) ) {
+			$cache[ $cache_key ] = [];
+			return $cache[ $cache_key ];
+		}
+
+		global $wpdb;
+
+		$events_table_name   = Simple_History::get_instance()->get_events_table_name();
+		$logger_placeholders = implode( ', ', array_fill( 0, count( $logger_slugs ), '%s' ) );
+
+		// Get distinct message templates for fallback loggers.
+		// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+		$templates = $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT DISTINCT message FROM {$events_table_name} WHERE logger IN ( {$logger_placeholders} )",
+				...$logger_slugs
+			)
+		);
+		// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+
+		$keys = [];
+
+		foreach ( $templates as $template ) {
+			if ( ! preg_match_all( '/\{(\w+)\}/', $template, $matches ) ) {
+				continue;
+			}
+
+			$keys = array_merge( $keys, $matches[1] );
+		}
+
+		$cache[ $cache_key ] = array_unique( $keys );
+
+		return $cache[ $cache_key ];
+	}
+
+	/**
+	 * Get logger slugs that have no registered messages.
+	 *
+	 * These loggers need a context scan fallback scoped to their actual
+	 * message template placeholders (extracted from the database).
+	 *
+	 * Uses a static variable to cache the result within a single request.
+	 *
+	 * @return array<string> Array of logger slugs.
+	 */
+	private function get_loggers_without_messages() {
+		// Cache keyed on user ID because get_loggers_that_user_can_read()
+		// is user-specific. Prevents stale results in tests and WP-CLI.
+		static $cache = [];
+
+		$user_id = get_current_user_id();
+
+		if ( isset( $cache[ $user_id ] ) ) {
+			return $cache[ $user_id ];
+		}
+
+		$simple_history        = Simple_History::get_instance();
+		$loggers_user_can_read = $simple_history->get_loggers_that_user_can_read();
+		$slugs                 = [];
+
+		foreach ( $loggers_user_can_read as $one_logger ) {
+			/** @var \Simple_History\Loggers\Logger $logger_instance */
+			$logger_instance = $one_logger['instance'];
+			$messages        = $logger_instance->get_messages();
+
+			if ( ! empty( $messages ) ) {
+				continue;
+			}
+
+			$slugs[] = $logger_instance->get_slug();
+		}
+
+		$cache[ $user_id ] = $slugs;
+
+		return $cache[ $user_id ];
+	}
+
+	/**
+	 * Convert a date_from/date_to argument to a timestamp.
+	 *
+	 * Numeric values are used as-is. A bare "Y-m-d" string is expanded to
+	 * the given day boundary time in the WordPress timezone. Any other
+	 * string is parsed leniently (e.g. "yesterday").
+	 *
+	 * @param mixed  $value Date value to convert.
+	 * @param string $arg_name Argument name, used in error messages.
+	 * @param string $day_boundary_time Time appended to bare dates, e.g. "00:00:00" or "23:59:59".
+	 * @return int Timestamp.
+	 * @throws \InvalidArgumentException When the value is not a valid date.
+	 */
+	protected function convert_date_arg_to_timestamp( $value, $arg_name, $day_boundary_time ) {
+		if ( is_numeric( $value ) ) {
+			return (int) $value;
+		}
+
+		if ( ! is_string( $value ) ) {
+			throw new \InvalidArgumentException( 'Invalid ' . esc_html( $arg_name ) );
+		}
+
+		// A bare date means the start or end of that day in WordPress timezone.
+		if ( $this->is_valid_date_format( $value, 'Y-m-d' ) ) {
+			$date = new \DateTimeImmutable( $value . ' ' . $day_boundary_time, wp_timezone() );
+
+			return $date->getTimestamp();
+		}
+
+		// Parse datetime string in WordPress timezone. Rethrow unparseable
+		// values as the same catchable exception type used by the rest of
+		// the argument validation.
+		try {
+			$date = new \DateTimeImmutable( $value, wp_timezone() );
+		} catch ( \Exception $exception ) {
+			throw new \InvalidArgumentException( 'Invalid ' . esc_html( $arg_name ) );
+		}
+
+		return $date->getTimestamp();
+	}
+
+	/**
+	 * Check if a date string is in the specified format.
+	 *
+	 * Example:
+	 * Function returns true for dates like "2024-03-29" and false for dates like "2024/03/29"
+	 * or "29-03-2024".
+	 *
+	 * @param string $date_string The date string to check.
+	 * @param string $format The format to check the date string against. Default is "Y-m-d" (which means for example "2024-03-29").
+	 * @return bool True if the date string is in the specified format, false otherwise.
+	 */
+	protected function is_valid_date_format( $date_string, $format = 'Y-m-d' ) {
+		// The "!" resets fields not present in the format to the Unix epoch
+		// instead of the current date. Without it, validating "Y-m" near the
+		// end of a month would overflow shorter months (e.g. "2024-02" parsed
+		// on the 31st becomes 2024-03-02) and wrongly reject valid values.
+		$d = \DateTime::createFromFormat( '!' . $format, $date_string );
+
+		return $d && $d->format( $format ) === $date_string;
+	}
+
+	/**
+	 * Get all sticky events. Does not take user capability into account.
+	 *
+	 * @return array<int> Array of sticky event IDs.
+	 */
+	protected function get_sticky_events() {
+		global $wpdb;
+
+		$simple_history = Simple_History::get_instance();
+		$contexts_table = $simple_history->get_contexts_table_name();
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+		return $wpdb->get_col(
+			$wpdb->prepare(
+				'SELECT history_id, value FROM %i WHERE `key` = %s',
+				$contexts_table,
+				'_sticky'
+			)
+		);
+	}
+}

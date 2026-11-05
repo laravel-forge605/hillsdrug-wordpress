@@ -1,0 +1,51 @@
+{
+	"$schema": "https://schemas.wp.org/trunk/block.json",
+	"apiVersion": 3,
+	"name": "wpgoplugins/simple-sitemap-block",
+	"version": "3.9.2",
+	"title": "Simple Sitemap",
+	"category": "simple-sitemap",
+	"icon": "editor-ul",
+	"description": "Display a visitor-friendly HTML sitemap for selected content types.",
+	"keywords": ["sitemap", "HTML sitemap", "content list"],
+	"textdomain": "simple-sitemap",
+	"editorScript": "simple-sitemap-block-editor-js",
+	"editorStyle": "simple-sitemap-block-editor-css",
+	"style": "simple-sitemap-css",
+	"supports": {
+		"html": false
+	},
+	"attributes": {
+		"id": { "type": "string", "default": "" },
+		"render_tab": { "type": "boolean", "default": false },
+		"page_depth": { "type": "number", "default": 0 },
+		"orderby": { "type": "string", "default": "title" },
+		"order": { "type": "string", "default": "asc" },
+		"show_excerpt": { "type": "boolean", "default": false },
+		"show_label": { "type": "boolean", "default": true },
+		"links": { "type": "boolean", "default": true },
+		"title_tag": { "type": "string", "default": "" },
+		"post_type_tag": { "type": "string", "default": "h3" },
+		"excerpt_tag": { "type": "string", "default": "div" },
+		"container_tag": { "type": "string", "default": "ul" },
+		"block_post_types": {
+			"type": "string",
+			"default": "[{ \"value\": \"page\", \"label\": \"Pages\" }]"
+		},
+		"gutenberg_block": { "type": "boolean", "default": true },
+		"target_blank": { "type": "boolean", "default": false },
+		"post_type_label": { "type": "object" },
+		"include": { "type": "string", "default": "" },
+		"exclude": { "type": "string", "default": "" },
+		"paginate": { "type": "boolean", "default": false },
+		"page_size": { "type": "number", "default": 50 },
+		"spacing_preset": { "type": "string", "default": "inherit" },
+		"item_spacing": { "type": "string", "default": "" },
+		"nested_spacing": { "type": "string", "default": "" }
+	},
+	"example": {
+		"attributes": {
+			"num_posts": 20
+		}
+	}
+}

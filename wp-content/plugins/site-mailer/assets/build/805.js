@@ -1,0 +1,1 @@
+"use strict";(globalThis.webpackChunksite_mailer=globalThis.webpackChunksite_mailer||[]).push([[805],{1805(e){e.exports=JSON.parse('{"example":{"component":"Örnek Bileşen"}}')}}]);

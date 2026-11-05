@@ -1,0 +1,101 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "version": "15.4",
+  "name": "yoast-seo-local/address",
+  "title":  "Yoast SEO: Local - Address",
+  "category": "yoast-seo-local",
+  "icon": "admin-home",
+  "keywords": [
+    "Address",
+    "Yoast",
+    "Local"
+  ],
+  "textdomain": "yoast-seo-local",
+  "attributes": {
+    "selectedLocation": {
+      "type": "number",
+      "default": 0
+    },
+    "hideName": {
+      "type": "boolean",
+      "default": false
+    },
+    "hideCompanyAddress": {
+      "type": "boolean",
+      "default": false
+    },
+    "showOnOneLine": {
+      "type": "boolean",
+      "default": false
+    },
+    "showState": {
+      "type": "boolean",
+      "default": true
+    },
+    "showCountry": {
+      "type": "boolean",
+      "default": false
+    },
+    "showPhone": {
+      "type": "boolean",
+      "default": true
+    },
+    "showPhone2nd": {
+      "type": "boolean",
+      "default": true
+    },
+    "showFax": {
+      "type": "boolean",
+      "default": true
+    },
+    "showEmail": {
+      "type": "boolean",
+      "default": true
+    },
+    "showURL": {
+      "type": "boolean",
+      "default": false
+    },
+    "showLogo": {
+      "type": "boolean",
+      "default": false
+    },
+    "showVatId": {
+      "type": "boolean",
+      "default": false
+    },
+    "showTaxId": {
+      "type": "boolean",
+      "default": false
+    },
+    "showCocId": {
+      "type": "boolean",
+      "default": false
+    },
+    "showPriceRange": {
+      "type": "boolean",
+      "default": false
+    },
+    "showOpeningHours": {
+      "type": "boolean",
+      "default": false
+    },
+    "hideClosedDays": {
+      "type": "boolean",
+      "default": false
+    },
+    "isPreview": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "example": {
+    "attributes": {
+      "isPreview": true
+    }
+  },
+  "supports": {
+    "multiple": true
+  }
+}

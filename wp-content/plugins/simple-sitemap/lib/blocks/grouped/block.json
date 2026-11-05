@@ -1,0 +1,46 @@
+{
+	"$schema": "https://schemas.wp.org/trunk/block.json",
+	"apiVersion": 3,
+	"name": "wpgoplugins/simple-sitemap-group-block",
+	"version": "3.9.2",
+	"title": "Simple Sitemap Group",
+	"category": "simple-sitemap",
+	"icon": "networking",
+	"description": "Display sitemap entries grouped by taxonomy terms.",
+	"keywords": ["sitemap", "grouped sitemap", "taxonomy"],
+	"textdomain": "simple-sitemap",
+	"editorScript": "simple-sitemap-block-editor-js",
+	"editorStyle": "simple-sitemap-block-editor-css",
+	"style": "simple-sitemap-css",
+	"supports": {
+		"html": false
+	},
+	"attributes": {
+		"id": { "type": "string", "default": "" },
+		"block_taxonomy": { "type": "string", "default": "category" },
+		"title_tag": { "type": "string", "default": "" },
+		"show_excerpt": { "type": "boolean", "default": false },
+		"excerpt_tag": { "type": "string", "default": "div" },
+		"links": { "type": "boolean", "default": true },
+		"orderby": { "type": "string", "default": "title" },
+		"order": { "type": "string", "default": "asc" },
+		"post_type_tag": { "type": "string", "default": "h3" },
+		"show_label": { "type": "boolean", "default": true },
+		"page_depth": { "type": "number", "default": 0 },
+		"container_tag": { "type": "string", "default": "ul" },
+		"block_post_type": { "type": "string", "default": "post" },
+		"num_terms": { "type": "number", "default": 0 },
+		"paginate": { "type": "boolean", "default": false },
+		"page_size": { "type": "number", "default": 50 },
+		"gutenberg_block": { "type": "boolean", "default": true },
+		"spacing_preset": { "type": "string", "default": "inherit" },
+		"item_spacing": { "type": "string", "default": "" },
+		"nested_spacing": { "type": "string", "default": "" }
+	},
+	"example": {
+		"attributes": {
+			"num_posts": 5,
+			"num_terms": 5
+		}
+	}
+}

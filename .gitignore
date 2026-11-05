@@ -1,0 +1,26 @@
+# WordPress configuration and secrets
+wp-config.php
+
+# User uploaded media
+wp-content/uploads/
+
+# Cache
+wp-content/cache/
+wp-content/litespeed/
+wp-content/upgrade/
+
+# Backups
+wp-content/backup/
+wp-content/backups/
+*.sql
+*.zip
+*.tar
+*.tar.gz
+
+# Logs
+*.log
+error_log
+
+# Temporary files
+.DS_Store
+Thumbs.db

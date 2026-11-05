@@ -1,0 +1,93 @@
+<?php
+
+namespace Simple_History\Dropins;
+
+use Simple_History\Helpers;
+
+/**
+ * Dropin Name: Experimental Features
+ * Dropin Description: Tell app to enable experimental features.
+ */
+class Experimental_Features_Dropin extends Dropin {
+	/** @inheritdoc */
+	public function loaded() {
+		$this->register_settings();
+
+		add_action( 'simple_history/settings_page/general_section_output', [ $this, 'on_general_section_output' ] );
+	}
+
+	/**
+	 * Register settings.
+	 */
+	public function register_settings() {
+		$settings_general_option_group = $this->simple_history::SETTINGS_GENERAL_OPTION_GROUP;
+
+		register_setting(
+			$settings_general_option_group,
+			'simple_history_experimental_features_enabled',
+			[
+				'sanitize_callback' => [ Helpers::class, 'sanitize_checkbox_input' ],
+			]
+		);
+	}
+
+	/**
+	 * Add settings field.
+	 *
+	 * Function fired from action `simple_history/settings_page/general_section_output`.
+	 */
+	public function on_general_section_output() {
+		$settings_section_general_id = $this->simple_history::SETTINGS_SECTION_GENERAL_ID;
+		$settings_menu_slug          = $this->simple_history::SETTINGS_MENU_SLUG;
+
+		add_settings_field(
+			'simple_history_experimental_features',
+			Helpers::get_settings_field_title_output( __( 'Experimental features', 'simple-history' ) ),
+			[ $this, 'settings_field' ],
+			$settings_menu_slug,
+			$settings_section_general_id
+		);
+	}
+
+	/**
+	 * Settings field output.
+	 */
+	public function settings_field() {
+		$detective_mode_enabled = Helpers::experimental_features_is_enabled();
+
+		?>
+		<label>
+			<input <?php checked( $detective_mode_enabled ); ?> type="checkbox" value="1" name="simple_history_experimental_features_enabled" />
+			<?php esc_html_e( 'Enable experimental features', 'simple-history' ); ?>
+		</label>
+		
+		<p class="description">
+			<?php
+			esc_html_e( 'Try out upcoming features that are still in testing.', 'simple-history' );
+			?>
+		</p>
+		
+		<p class="description">
+			<?php
+			esc_html_e( 'Please note that these features may not work as expected and could change or be removed in future updates.', 'simple-history' );
+			?>
+		</p>
+
+		<details style="margin-top: 0.5em;">
+			<summary class="description" style="cursor: pointer;">
+				<?php esc_html_e( 'View current experimental features', 'simple-history' ); ?>
+			</summary>
+			<ul class="description" style="margin-top: 0.5em; list-style: disc; padding-left: 1.5em;">
+				<li><?php esc_html_e( 'Role & Capability change logging', 'simple-history' ); ?></li>
+				<li><?php esc_html_e( 'Failed email logging', 'simple-history' ); ?></li>
+				<li><?php esc_html_e( 'Failed application password logins are logged', 'simple-history' ); ?></li>
+				<li><?php esc_html_e( 'WP-CLI events show the SSH connection they came from', 'simple-history' ); ?></li>
+				<li><?php esc_html_e( 'History column and "View history" link in the post and page lists', 'simple-history' ); ?></li>
+				<li><?php esc_html_e( 'Personal-data erasure: anonymize a user\'s activity-log entries from Tools → Erase Personal Data', 'simple-history' ); ?></li>
+				<li><?php esc_html_e( 'Personal-data export includes activity by others about the person, with the other people\'s names and emails redacted', 'simple-history' ); ?></li>
+				<li><?php esc_html_e( 'Read-only Abilities API access to the event log (WordPress 6.9 and later)', 'simple-history' ); ?></li>
+			</ul>
+		</details>
+		<?php
+	}
+}

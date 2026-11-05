@@ -1,0 +1,174 @@
+<?php
+
+namespace Simple_History\Channels;
+
+/**
+ * Human-readable log formatter.
+ *
+ * Produces easy-to-read log entries with ISO 8601 timestamps
+ * and key=value metadata.
+ *
+ * Example output:
+ * [2025-12-05T12:34:56Z] INFO SimpleUserLogger: User logged in | message_key=user_logged_in user_id=42 initiator=wp_user
+ * [2025-12-05T12:35:10Z] INFO SimpleUserLogger: Edited the profile for user "john" | Role added: administrator; Role removed: author | initiator=wp_user ...
+ *
+ * @since 5.7.0
+ */
+class Human_Readable_Formatter extends Formatter {
+	/**
+	 * Essential context fields for human-readable output.
+	 * Excludes server_remote_addr as it adds noise to manual log inspection.
+	 *
+	 * @var array<int, string>
+	 */
+	protected const HUMAN_READABLE_FIELDS = [
+		'_message_key',
+		'_user_id',
+		'_user_login',
+		'_user_email',
+	];
+
+	/**
+	 * Map of log level lengths for alignment.
+	 * Longest level is "EMERGENCY" (9 chars).
+	 *
+	 * @var int
+	 */
+	private const LEVEL_WIDTH = 9;
+
+	/**
+	 * Get the unique identifier for this formatter.
+	 *
+	 * @return string The formatter slug.
+	 */
+	public function get_slug() {
+		return 'human_readable';
+	}
+
+	/**
+	 * Get the display name for this formatter.
+	 *
+	 * @return string The human-readable formatter name.
+	 */
+	public function get_name() {
+		return __( 'Human-readable', 'simple-history' );
+	}
+
+	/**
+	 * Get the description for this formatter.
+	 *
+	 * @return string Short description of the format output.
+	 */
+	public function get_description() {
+		return __( 'Easy-to-read format with ISO 8601 timestamps. Best for manual log inspection.', 'simple-history' );
+	}
+
+	/**
+	 * Format a log entry in human-readable format.
+	 *
+	 * @param array  $event_data        The event data array.
+	 * @param string $formatted_message The interpolated message string.
+	 * @return string The formatted log entry with newline.
+	 */
+	public function format( array $event_data, string $formatted_message ) {
+		$date      = $event_data['date'] ?? current_time( 'mysql', 1 );
+		$timestamp = $this->escape_text( $this->get_event_timestamp_utc( $date ) );
+		$level     = $this->escape_text( strtoupper( (string) ( $event_data['level'] ?? 'info' ) ) );
+		$logger    = $this->escape_text( (string) ( $event_data['logger'] ?? 'Unknown' ) );
+		$initiator = $event_data['initiator'] ?? 'unknown';
+		$context   = $event_data['context'] ?? [];
+
+		// Pad level to fixed width for alignment.
+		$level_padded = str_pad( $level, self::LEVEL_WIDTH, ' ', STR_PAD_RIGHT );
+
+		// Build structured data from essential fields (human-readable subset).
+		$structured_parts = [];
+
+		// Always include initiator.
+		$structured_parts[] = 'initiator=' . $this->quote_value( (string) $initiator );
+
+		$essential = $this->get_human_readable_context( $context );
+
+		foreach ( $essential as $key => $value ) {
+			$structured_parts[] = $key . '=' . $this->quote_value( (string) $value );
+		}
+
+		$structured_suffix = '';
+		if ( count( $structured_parts ) > 0 ) {
+			$structured_suffix = ' | ' . implode( ' ', $structured_parts );
+		}
+
+		// What changed, like "Role added: administrator; Role removed: author".
+		// get_details_line() has escaped the line breaks already.
+		$details_line   = str_replace( '|', '\\|', $this->get_details_line( $event_data ) );
+		$details_suffix = $details_line === '' ? '' : ' | ' . $details_line;
+
+		// Every value on the line goes through escape_text() or quote_value(),
+		// and File_Channel::send_event() catches any line break left anyway.
+		return sprintf(
+			"[%s] %s %s: %s%s%s\n",
+			$timestamp,
+			$level_padded,
+			$logger,
+			$this->escape_text( $formatted_message ),
+			$details_suffix,
+			$structured_suffix
+		);
+	}
+
+	/**
+	 * Escape free text on the line: line breaks and control characters, and
+	 * "|" as "\|", so text can never look like the start of the next section.
+	 * Backslashes are escaped first, so "\|" is unambiguous.
+	 *
+	 * @param string $value Text to escape.
+	 * @return string
+	 */
+	private function escape_text( string $value ): string {
+		return str_replace( '|', '\\|', $this->escape_line_breaks( $value ) );
+	}
+
+	/**
+	 * Format a key=value value, quoted logfmt style when needed, so a value
+	 * like "x user_id=1" can't add fields of its own.
+	 *
+	 * Values with whitespace, "=", a quote, "|", a control character, or that
+	 * are empty, are put in double quotes with the quotes inside escaped.
+	 *
+	 * @param string $value Value to format.
+	 * @return string
+	 */
+	private function quote_value( string $value ): string {
+		$escaped = $this->escape_line_breaks( $value );
+
+		if ( $value !== '' && $escaped === $value && preg_match( '/[\s="|]/', $value ) !== 1 ) {
+			return $value;
+		}
+
+		return '"' . str_replace( '"', '\\"', $escaped ) . '"';
+	}
+
+	/**
+	 * Extract essential fields for human-readable output.
+	 *
+	 * Uses a reduced set of fields compared to other formatters,
+	 * excluding server_remote_addr to reduce noise.
+	 *
+	 * @param array $context The event context array.
+	 * @return array<string, mixed> Filtered context with clean keys.
+	 */
+	protected function get_human_readable_context( array $context ): array {
+		$result = [];
+
+		foreach ( self::HUMAN_READABLE_FIELDS as $field ) {
+			if ( ! isset( $context[ $field ] ) || ! is_scalar( $context[ $field ] ) ) {
+				continue;
+			}
+
+			$clean_key            = ltrim( $field, '_' );
+			$result[ $clean_key ] = $context[ $field ];
+		}
+
+		return $result;
+	}
+}

@@ -1,0 +1,67 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=utf-8\n"
+"X-Generator: babel-plugin-makepot\n"
+
+#: lib/src/blocks/extend-blocks.js:180
+msgid "Exclude associated child pages?"
+msgstr ""
+
+#: lib/src/blocks/extend-blocks.js:184
+msgid "Remove child pages for excluded post IDs"
+msgstr ""
+
+#: lib/src/blocks/extend-blocks.js:368
+msgid "Sitemap Styles"
+msgstr ""
+
+#: lib/src/blocks/extend-blocks.js:454
+msgid "Featured Image Settings"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap-group/index.js:29
+#: lib/src/blocks/simple-sitemap/index.js:28
+msgid "Sitemap"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap-group/index.js:30
+msgid "Group"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap-group/index.js:31
+#: lib/src/blocks/simple-sitemap/index.js:30
+msgid "HTML Sitemap"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap-group/index.js:87
+#: lib/src/blocks/simple-sitemap/index.js:215
+msgid "General Settings"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap/index.js:285
+msgid "Open links in new tab"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap/index.js:29
+msgid "Single"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap/index.js:302
+msgid "Post Types Labels"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap/index.js:308
+msgid "Post type"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap/index.js:326
+msgid "New Label"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap/index.js:338
+msgid "Tab Settings"
+msgstr ""
+
+#: lib/src/blocks/simple-sitemap/index.js:351
+msgid "Page Settings"
+msgstr ""

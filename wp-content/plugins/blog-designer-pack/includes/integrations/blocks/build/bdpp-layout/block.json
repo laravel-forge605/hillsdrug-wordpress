@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "name": "bdpp/bdpp-layout-selector",
+  "version": "1.0.0",
+  "title": "Blog Designer Pack - Layouts",
+  "keywords": [
+	"blog",
+	"post",
+	"post grid"
+  ],
+  "category": "widgets",
+  "icon": "editor-bold",
+  "description": "Choose a post display layout.",
+  "example": {},
+  "attributes": {
+	"layout_id": {
+	  "type": "number",
+	  "default": 0
+	}
+  },
+  "supports": {
+	"html": false,
+	"align": [
+	  "wide",
+	  "full"
+	]
+  },
+  "textdomain": "blog-designer-pack",
+  "editorScript": "file:./index.js",
+  "editorStyle": "file:./index.css",
+  "render": "file:./render.php"
+}

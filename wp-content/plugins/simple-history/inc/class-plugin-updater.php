@@ -1,0 +1,484 @@
+<?php
+
+namespace Simple_History;
+
+/**
+ * Class that handles plugin info and plugin updates for add-ons plugins.
+ *
+ * This class is instantiated once for each add-on plugin.
+ */
+class Plugin_Updater {
+	/**
+	 * @var string
+	 */
+	public $plugin_id;
+
+	/**
+	 * @var string
+	 */
+	public $plugin_slug;
+
+	/**
+	 * @var string
+	 */
+	public $version;
+
+	/**
+	 * @var string
+	 */
+	public $api_url;
+
+	/**
+	 * @var string
+	 */
+	public $cache_key;
+
+	/**
+	 * @var string
+	 */
+	public $cache_key_plugin_info;
+
+	/**
+	 * @var boolean
+	 *
+	 * Default true.
+	 *
+	 * Only disable this for debugging.
+	 */
+	public $cache_allowed = true;
+
+	/**
+	 * Largest update answer read from the server, in bytes.
+	 */
+	private const MAX_RESPONSE_BYTES = 256 * 1024;
+
+	/**
+	 * The stored answer, read once per request. Null until read.
+	 *
+	 * @var object|false|null
+	 */
+	private $stored_answer = null;
+
+	/**
+	 * @param string $plugin_id   The ID of the plugin.
+	 * @param string $plugin_slug The slug of the plugin.
+	 * @param string $version     The current version of the plugin.
+	 * @param string $api_url     The API URL to the update server.
+	 */
+	public function __construct( $plugin_id, $plugin_slug, $version, $api_url ) {
+		$this->plugin_id   = $plugin_id;
+		$this->plugin_slug = $plugin_slug;
+		$this->version     = $version;
+		$this->api_url     = $api_url;
+
+		$this->cache_key             = self::get_cache_key_for_slug( $this->plugin_slug );
+		$this->cache_key_plugin_info = 'simple_history_updater_info_cache_' . str_replace( '-', '_', $this->plugin_slug );
+
+		add_filter( 'plugins_api', array( $this, 'on_plugins_api_handle_plugin_info' ), 20, 3 );
+		add_filter( 'site_transient_update_plugins', array( $this, 'site_transient_update_plugins_update' ) );
+		add_action( 'upgrader_process_complete', array( $this, 'purge' ), 10, 2 );
+
+		// Before core's own wp_update_plugins() at priority 10 on this hook.
+		add_action( 'load-update-core.php', array( $this, 'on_force_check' ), 9 );
+
+		// Ask the update server only during WordPress's own plugin update check,
+		// never while something merely reads the update data. Reading happens on
+		// almost every admin page (the menu badge, the admin bar), and a remote
+		// call there makes the page wait for simple-history.com.
+		add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'on_pre_set_update_plugins' ) );
+	}
+
+	/**
+	 * Ask the update server again when someone clicks "Check again" on Dashboard → Updates.
+	 *
+	 * Core's force-check only forces the WordPress version check, and our
+	 * cached answer would otherwise hide a new release for up to an hour.
+	 * Ask here instead of waiting for core's plugin check, which it skips
+	 * when the last one ran less than a minute ago. When it does run, it
+	 * gets the fresh answer from the cache.
+	 */
+	public function on_force_check() {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Core's own link has no nonce; this only clears a cache.
+		if ( empty( $_GET['force-check'] ) || ! current_user_can( 'update_plugins' ) ) {
+			return;
+		}
+
+		delete_transient( $this->cache_key );
+		delete_transient( $this->cache_key_plugin_info );
+
+		$this->request();
+	}
+
+	/**
+	 * Name of the option holding an add-on's last update-check answer.
+	 *
+	 * Unlike the cache transient it never expires, so the update data can
+	 * always be read without asking the server again.
+	 *
+	 * @param string $slug Plugin slug.
+	 * @return string
+	 */
+	public static function get_answer_option_for_slug( $slug ) {
+		return 'simple_history_updater_answer_' . str_replace( '-', '_', $slug );
+	}
+
+	/**
+	 * Build the transient key used to cache an add-on's update-check response.
+	 *
+	 * The single source of truth for this key, so AddOn_Plugin::purge_updater_cache()
+	 * and tests can derive it instead of duplicating the literal.
+	 *
+	 * @param string $slug Plugin slug.
+	 * @return string
+	 */
+	public static function get_cache_key_for_slug( $slug ) {
+		return 'simple_history_updater_cache_' . str_replace( '-', '_', $slug );
+	}
+
+	/**
+	 * The add-on this updater serves, for reading and refreshing its license.
+	 *
+	 * @return AddOn_Plugin
+	 */
+	protected function get_addon_plugin() {
+		return new AddOn_Plugin(
+			$this->plugin_id,
+			$this->plugin_slug,
+			$this->version,
+		);
+	}
+
+	/**
+	 * Get the license key. Normally, your plugin would have a settings page where
+	 * you ask for and store a license key. Fetch it here.
+	 *
+	 * @return string
+	 */
+	protected function get_license_key() {
+		return $this->get_addon_plugin()->get_license_key();
+	}
+
+	/**
+	 * Fetch the update info from the remote server running the Lemon Squeezy plugin.
+	 *
+	 * @return object|stdClass|bool
+	 */
+	public function request() {
+		$lsq_license_key = $this->get_license_key();
+
+		// If no licence key is set, user get no updates.
+		if ( ! $lsq_license_key ) {
+			return false;
+		}
+
+		$remote = get_transient( $this->cache_key );
+
+		if ( $remote !== false && $this->cache_allowed ) {
+			if ( $remote === 'error' ) {
+				return false;
+			}
+
+			return json_decode( $remote );
+		}
+
+		// Get the update data from the remote server, i.e. our own server.
+		$url = add_query_arg(
+			[
+				'license_key' => $lsq_license_key,
+				'plugin_slug' => $this->plugin_slug,
+				'version'     => $this->version,
+			],
+			$this->api_url . '/update',
+		);
+
+		// phpcs:ignore WordPressVIPMinimum.Functions.RestrictedFunctions.wp_remote_get_wp_remote_get
+		$remote = wp_remote_get(
+			$url,
+			[
+				'timeout'             => 3,
+				// An update answer is a few KB. Keeps a broken server's reply out
+				// of memory and the database; a cut-off body fails to decode below.
+				'limit_response_size' => self::MAX_RESPONSE_BYTES,
+			]
+		);
+
+		if ( is_wp_error( $remote ) || empty( wp_remote_retrieve_body( $remote ) ) ) {
+			// Cache errors for 10 minutes.
+			set_transient( $this->cache_key, 'error', MINUTE_IN_SECONDS * 10 );
+
+			return false;
+		}
+
+		$response_code = wp_remote_retrieve_response_code( $remote );
+		$payload       = wp_remote_retrieve_body( $remote );
+		$decoded       = json_decode( $payload );
+
+		// 200 is an update answer. 401 is the endpoint's answer for a key that
+		// is expired, disabled or unknown, and since issue 315 it carries the
+		// key's status too. Anything else, or a non-JSON body from an older
+		// server, is an error like before.
+		if ( ! in_array( $response_code, [ 200, 401 ], true ) || ! is_object( $decoded ) ) {
+			// Cache errors for 10 minutes.
+			set_transient( $this->cache_key, 'error', MINUTE_IN_SECONDS * 10 );
+
+			return false;
+		}
+
+		$this->store_license_from_payload( $decoded );
+		$this->get_addon_plugin()->update_new_features_from_response( $decoded->whats_new ?? null );
+
+		// Kept without expiry and not autoloaded: read back by
+		// get_stored_answer() when only WordPress's own check may ask the server.
+		// Only the parts that offer the update are kept, not the license details.
+		update_option( self::get_answer_option_for_slug( $this->plugin_slug ), $this->get_answer_to_store( $decoded ), false );
+		$this->stored_answer = null;
+
+		// Cache a 200 answer for an hour. Cache a 401 refusal for only 10
+		// minutes, the same window used for the network/decode errors above,
+		// so a renewed customer waits at most ten minutes for updates to
+		// return rather than up to an hour.
+		$cache_duration = $response_code === 200 ? HOUR_IN_SECONDS : MINUTE_IN_SECONDS * 10;
+		set_transient( $this->cache_key, $payload, $cache_duration );
+
+		return $decoded;
+	}
+
+	/**
+	 * Hand the `license` object from an update response to the add-on.
+	 *
+	 * Older servers send no such key and newer ones send null when Lemon
+	 * Squeezy could not be reached. Both leave the stored license details
+	 * untouched, but a successful update answer is itself evidence the key
+	 * is valid, so it still clears a previously stored problem verdict.
+	 *
+	 * @param object $decoded Decoded update response.
+	 * @return void
+	 */
+	private function store_license_from_payload( $decoded ) {
+		if ( ! isset( $decoded->license ) || ! is_object( $decoded->license ) ) {
+			if ( ! empty( $decoded->success ) ) {
+				$this->get_addon_plugin()->note_valid_key_without_details();
+			}
+
+			return;
+		}
+
+		$this->get_addon_plugin()->update_license_status_from_response( (array) $decoded->license );
+	}
+
+	/**
+	 * Override the WordPress request to return the correct plugin info.
+	 *
+	 * @see https://developer.wordpress.org/reference/hooks/plugins_api/
+	 *
+	 * @param false|object|array $result False if nothing is found, default WP_Error if request failed. An array of data on success.
+	 * @param string             $action The type of information being requested from the Plugin Install API.
+	 * @param object             $args  Plugin API arguments.
+	 * @return object|bool
+	 */
+	public function on_plugins_api_handle_plugin_info( $result, $action, $args ) {
+		// Bail if this is not about getting plugin information.
+		if ( $action !== 'plugin_information' ) {
+			return $result;
+		}
+
+		// Bail if it is not our plugin.
+		if ( $this->plugin_slug !== $args->slug ) {
+			return $result;
+		}
+
+		// Check cache/transient first.
+		$remote_json = get_transient( $this->cache_key_plugin_info );
+		if ( $remote_json !== false && $this->cache_allowed ) {
+			return $remote_json;
+		}
+
+		// Here: Get plugin info from simple-history.com.
+		// URLs for a plugin will be like:
+		// https://simple-history.com/wp-json/simple-history/v1/plugins/simple-history-extended-settings.
+		$api_url_base   = 'https://simple-history.com/wp-json/simple-history/v1/plugins/';
+		$api_for_plugin = $api_url_base . $this->plugin_slug;
+
+		// phpcs:ignore WordPressVIPMinimum.Functions.RestrictedFunctions.wp_remote_get_wp_remote_get
+		$plugin_info_response = wp_remote_get( $api_for_plugin );
+
+		// Bail if response was not ok.
+		if ( is_wp_error( $plugin_info_response ) || wp_remote_retrieve_response_code( $plugin_info_response ) !== 200 || empty( wp_remote_retrieve_body( $plugin_info_response ) ) ) {
+			return $result;
+		}
+
+		$remote_json = json_decode( wp_remote_retrieve_body( $plugin_info_response ), false );
+
+		// Bail if json decode error.
+		if ( $remote_json === null ) {
+			return $result;
+		}
+
+		// Some things must be arrays, not objects.
+		$remote_json->sections     = (array) $remote_json->sections;
+		$remote_json->tags         = (array) $remote_json->tags;
+		$remote_json->banners      = (array) $remote_json->banners;
+		$remote_json->contributors = (array) $remote_json->contributors;
+
+		// Make all contributors arrays, not objects.
+		foreach ( $remote_json->contributors as $contributor_key => $contributor_value ) {
+			$remote_json->contributors[ $contributor_key ] = (array) $contributor_value;
+		}
+
+		// Cache the result for 10 minutes.
+		set_transient( $this->cache_key_plugin_info, $remote_json, MINUTE_IN_SECONDS * 10 );
+
+		return $remote_json;
+	}
+
+	/**
+	 * Override the WordPress request to check if an update is available.
+	 *
+	 * @see https://make.wordpress.org/core/2020/07/30/recommended-usage-of-the-updates-api-to-support-the-auto-updates-ui-for-plugins-and-themes-in-wordpress-5-5/
+	 *
+	 * @param object $transient The pre-saved, cached data for plugins.
+	 * @return object $transient
+	 */
+	public function site_transient_update_plugins_update( $transient ) {
+		if ( empty( $transient->checked ) ) {
+			return $transient;
+		}
+
+		$res = (object) array(
+			'id'            => $this->plugin_id,
+			'slug'          => $this->plugin_slug,
+			'plugin'        => $this->plugin_id,
+			'new_version'   => $this->version,
+			'url'           => '',
+			'package'       => '',
+			'icons'         => array(),
+			'banners'       => array(),
+			'banners_rtl'   => array(),
+			'tested'        => '',
+			'requires_php'  => '',
+			'compatibility' => new \stdClass(),
+		);
+
+		$remote = $this->get_stored_answer();
+
+		// Nothing stored yet, like right after updating from a version that did not
+		// store answers. Ask once rather than hide an update until WordPress's next
+		// check. request() caches its answer, errors included, so the remote call
+		// can't repeat on every page.
+		if ( $remote === false ) {
+			$remote = $this->request();
+		}
+
+		if (
+			$remote && ! empty( $remote->success ) && ! empty( $remote->update )
+			&& version_compare( $this->version, $remote->update->version, '<' )
+		) {
+			// Update is available for plugin.
+			$res->new_version = $remote->update->version;
+			$res->package     = $remote->update->download_link;
+
+			$transient->response[ $res->plugin ] = $res;
+			unset( $transient->no_update[ $res->plugin ] );
+		} else {
+			// The saved update data can still offer an update from an earlier
+			// answer, like before the license expired, until WordPress's next check.
+			unset( $transient->response[ $res->plugin ] );
+
+			// No update is available for plugin.
+			// Adding the "mock" item to the `no_update` property is required
+			// for the enable/disable auto-updates links to correctly appear in UI.
+			$transient->no_update[ $res->plugin ] = $res;
+		}
+
+		return $transient;
+	}
+
+	/**
+	 * Ask the update server while WordPress saves its own update check.
+	 *
+	 * WordPress saves the update data twice per check (first to stamp
+	 * last_checked, then with the result), and also after installs and
+	 * deletes. The 1-hour cache in request() keeps that to one remote call.
+	 *
+	 * @param mixed $value Update data being saved.
+	 * @return mixed
+	 */
+	public function on_pre_set_update_plugins( $value ) {
+		if ( ! is_object( $value ) || empty( $value->checked ) ) {
+			return $value;
+		}
+
+		$this->request();
+
+		return $this->site_transient_update_plugins_update( $value );
+	}
+
+	/**
+	 * The part of an update answer that is kept for get_stored_answer().
+	 *
+	 * @param object $decoded Decoded answer from the update server.
+	 * @return string JSON with success and, when there is one, the update's version and download link.
+	 */
+	private function get_answer_to_store( $decoded ) {
+		$answer = [
+			'success' => ! empty( $decoded->success ),
+		];
+
+		if ( $answer['success'] && isset( $decoded->update->version, $decoded->update->download_link ) && is_string( $decoded->update->version ) && is_string( $decoded->update->download_link ) ) {
+			$answer['update'] = [
+				'version'       => $decoded->update->version,
+				'download_link' => $decoded->update->download_link,
+			];
+		}
+
+		return (string) wp_json_encode( $answer );
+	}
+
+	/**
+	 * The last answer from the update server, without asking it again.
+	 *
+	 * Read once per request: the update data filter runs many times per page.
+	 *
+	 * @return object|false Decoded answer, or false when there is none.
+	 */
+	public function get_stored_answer() {
+		if ( $this->stored_answer !== null ) {
+			return $this->stored_answer;
+		}
+
+		$payload = get_option( self::get_answer_option_for_slug( $this->plugin_slug ) );
+		$decoded = is_string( $payload ) && $payload !== '' ? json_decode( $payload ) : null;
+
+		$this->stored_answer = is_object( $decoded ) ? $decoded : false;
+
+		return $this->stored_answer;
+	}
+
+	/**
+	 * When the update is complete, purge the cache.
+	 *
+	 * @see https://developer.wordpress.org/reference/hooks/upgrader_process_complete/
+	 *
+	 * @param \WP_Upgrader $upgrader The WP_Upgrader instance.
+	 * @param array        $options Array of bulk item update arguments.
+	 * @return void
+	 */
+	public function purge( $upgrader, $options ) {
+		if (
+			! $this->cache_allowed
+			|| $options['action'] !== 'update'
+			|| $options['type'] !== 'plugin'
+			|| empty( $options['plugins'] )
+		) {
+			return;
+		}
+
+		foreach ( $options['plugins'] as $plugin ) {
+			if ( $plugin !== $this->plugin_id ) {
+				continue;
+			}
+
+			delete_transient( $this->cache_key );
+		}
+	}
+}

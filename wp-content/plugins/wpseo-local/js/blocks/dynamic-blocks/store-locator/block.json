@@ -1,0 +1,103 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "version": "15.4",
+  "name": "yoast-seo-local/store-locator",
+  "title":  "Yoast SEO: Local - Store locator",
+  "category": "yoast-seo-local",
+  "icon": "location",
+  "keywords": [
+    "Store locator",
+    "Yoast",
+    "Local"
+  ],
+  "textdomain": "yoast-seo-local",
+  "attributes": {
+    "showMap": {
+      "type": "boolean",
+      "default": true
+    },
+    "allowScrolling": {
+      "type": "boolean",
+      "default": true
+    },
+    "allowDragging": {
+      "type": "boolean",
+      "default": true
+    },
+    "markerClustering": {
+      "type": "boolean",
+      "default": false
+    },
+    "showCategoryFilter": {
+      "type": "bolean",
+      "default": false
+    },
+    "showRadius": {
+      "type": "boolean",
+      "default": false
+    },
+    "showNearest": {
+      "type": "boolean",
+      "default": true
+    },
+    "zoomLevel": {
+      "type": "number",
+      "default": -1
+    },
+    "searchRadius": {
+      "type": "number",
+      "default": 10
+    },
+    "maxNumber": {
+      "type": "string",
+      "default": "200"
+    },
+    "mapType": {
+      "type": "string",
+      "default": "roadmap"
+    },
+    "mapWidth": {
+      "type": "string",
+      "default": "100%"
+    },
+    "mapHeight": {
+      "type": "number",
+      "default": 300
+    },
+    "showState": {
+      "type": "boolean",
+      "default": true
+    },
+    "showCountry": {
+      "type": "boolean",
+      "default": false
+    },
+    "showPhone": {
+      "type": "boolean",
+      "default": true
+    },
+    "showPhone2nd": {
+      "type": "boolean",
+      "default": true
+    },
+    "showFax": {
+      "type": "boolean",
+      "default": true
+    },
+    "showEmail": {
+      "type": "boolean",
+      "default": true
+    },
+    "showURL": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "example": {
+    "attributes": {}
+  },
+  "supports": {
+    "multiple": false
+  }
+}

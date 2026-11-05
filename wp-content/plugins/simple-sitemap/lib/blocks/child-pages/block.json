@@ -1,0 +1,43 @@
+{
+	"$schema": "https://schemas.wp.org/trunk/block.json",
+	"apiVersion": 3,
+	"name": "wpgoplugins/simple-sitemap-child-pages-block",
+	"version": "3.9.2",
+	"title": "Simple Sitemap: Child Pages",
+	"category": "simple-sitemap",
+	"icon": "list-view",
+	"description": "Display the published child-page hierarchy for a selected parent page.",
+	"keywords": ["sitemap", "child pages", "page hierarchy"],
+	"textdomain": "simple-sitemap",
+	"editorScript": "simple-sitemap-block-editor-js",
+	"editorStyle": "simple-sitemap-block-editor-css",
+	"style": "simple-sitemap-css",
+	"usesContext": ["postId", "postType"],
+	"supports": {
+		"html": false,
+		"anchor": true,
+		"spacing": {
+			"margin": true,
+			"padding": true
+		},
+		"typography": {
+			"fontSize": true,
+			"lineHeight": true
+		}
+	},
+	"attributes": {
+		"parent_id": { "type": "number", "default": 0 },
+		"depth": { "type": "number", "default": 0 },
+		"orderby": { "type": "string", "default": "menu_order" },
+		"order": { "type": "string", "default": "asc" },
+		"show_parent": { "type": "boolean", "default": false },
+		"spacing_preset": { "type": "string", "default": "inherit" },
+		"item_spacing": { "type": "string", "default": "" },
+		"nested_spacing": { "type": "string", "default": "" }
+	},
+	"example": {
+		"attributes": {
+			"depth": 2
+		}
+	}
+}

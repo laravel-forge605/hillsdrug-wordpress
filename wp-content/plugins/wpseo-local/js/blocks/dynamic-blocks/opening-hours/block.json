@@ -1,0 +1,65 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "version": "15.4",
+  "name": "yoast-seo-local/opening-hours",
+  "title":  "Yoast SEO: Local - Opening Hours",
+  "category": "yoast-seo-local",
+  "icon": "clock",
+  "keywords": [
+    "Opening hours",
+    "Yoast",
+    "Local"
+  ],
+  "textdomain": "yoast-seo-local",
+  "attributes": {
+    "selectedLocation": {
+      "type": "number",
+      "default": 0
+    },
+    "showMonday": {
+      "type": "boolean",
+      "default": true
+    },
+    "showTuesday": {
+      "type": "boolean",
+      "default": true
+    },
+    "showWednesday": {
+      "type": "boolean",
+      "default": true
+    },
+    "showThursday": {
+      "type": "boolean",
+      "default": true
+    },
+    "showFriday": {
+      "type": "boolean",
+      "default": true
+    },
+    "showSaturday": {
+      "type": "boolean",
+      "default": true
+    },
+    "showSunday": {
+      "type": "boolean",
+      "default": true
+    },
+    "showOpenLabel": {
+      "type": "boolean",
+      "default": false
+    },
+    "hideClosed": {
+      "type": "boolean",
+      "default": false
+    },
+    "extraComment": {
+      "type": "string"
+    }
+  },
+  "example": {
+    "attributes": {
+      "selectedLocation": "example"
+    }
+  }
+}

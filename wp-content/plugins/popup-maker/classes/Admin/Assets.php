@@ -1,0 +1,381 @@
+<?php
+/**
+ * Class for Admin Assets
+ *
+ * @package   PopupMaker
+ * @copyright Copyright (c) 2024, Code Atlantic LLC
+ */
+
+/**
+ * Class PUM_Admin_Assets
+ *
+ * @since 1.7.0
+ */
+class PUM_Admin_Assets {
+
+	/**
+	 * @var string
+	 *
+	 * @deprecated 1.21.0
+	 */
+	public static $suffix = '';
+
+	/**
+	 * @var string
+	 */
+	public static $js_url;
+
+	/**
+	 * @var string
+	 */
+	public static $css_url;
+
+	/**
+	 * @var bool Use minified libraries if SCRIPT_DEBUG is turned off.
+	 */
+	public static $debug;
+
+	/**
+	 * Initialize
+	 */
+	public static function init() {
+		self::$debug   = defined( 'SCRIPT_DEBUG' ) && SCRIPT_DEBUG;
+		self::$suffix  = self::$debug ? '' : '.min';
+		self::$js_url  = Popup_Maker::$URL . 'dist/assets/';
+		self::$css_url = Popup_Maker::$URL . 'dist/assets/';
+
+		add_action( 'admin_enqueue_scripts', [ __CLASS__, 'register_admin_scripts' ] );
+		add_action( 'admin_print_scripts', [ __CLASS__, 'maybe_localize_and_templates' ], - 1 );
+		add_action( 'admin_print_footer_scripts', [ __CLASS__, 'maybe_localize_and_templates' ], - 1 );
+		self::add_localization_before_printer( 'admin_print_scripts', 'print_head_scripts' );
+		self::add_localization_before_printer( 'admin_print_footer_scripts', '_wp_footer_scripts' );
+
+		add_action( 'admin_enqueue_scripts', [ __CLASS__, 'register_admin_styles' ], 100 );
+
+		add_action( 'admin_enqueue_scripts', [ __CLASS__, 'fix_broken_extension_scripts' ], 100 );
+	}
+
+	/**
+	 * Recheck after all earlier-priority enqueues and immediately before WordPress prints scripts.
+	 *
+	 * @param string $hook    Script printing hook.
+	 * @param string $printer WordPress printer callback.
+	 *
+	 * @return void
+	 */
+	private static function add_localization_before_printer( $hook, $printer ) {
+		$priority = has_action( $hook, $printer );
+
+		if ( false === $priority ) {
+			return;
+		}
+
+		remove_action( $hook, $printer, $priority );
+		add_action( $hook, [ __CLASS__, 'maybe_localize_and_templates' ], $priority );
+		add_action( $hook, $printer, $priority );
+	}
+
+	public static function fix_broken_extension_scripts() {
+
+		if ( wp_script_is( 'pum-mci-admin' ) && class_exists( 'PUM_MCI' ) && version_compare( PUM_MCI::$VER, '1.3.0', '<' ) && ! pum_is_settings_page() ) {
+			wp_dequeue_script( 'pum-mci-admin' );
+		}
+	}
+
+	/**
+	 * Load Admin Scripts
+	 */
+	public static function register_admin_scripts() {
+		wp_register_script( 'pum-admin-general', self::$js_url . 'admin-general.js', [ 'jquery', 'wp-color-picker', 'jquery-ui-slider', 'wp-util' ], Popup_Maker::$VER, true );
+		wp_register_script( 'pum-admin-batch', self::$js_url . 'admin-batch.js', [ 'pum-admin-general' ], Popup_Maker::$VER, true );
+		wp_register_script( 'pum-admin-popup-editor', self::$js_url . 'admin-popup-editor.js', [ 'pum-admin-general' ], Popup_Maker::$VER, true );
+		wp_register_script( 'pum-admin-theme-editor', self::$js_url . 'admin-theme-editor.js', [ 'pum-admin-general' ], Popup_Maker::$VER, true );
+		wp_register_script( 'pum-admin-settings-page', self::$js_url . 'admin-settings-page.js', [ 'pum-admin-general' ], Popup_Maker::$VER, true );
+		wp_register_script( 'pum-admin-shortcode-ui', self::$js_url . 'admin-shortcode-ui.js', [ 'pum-admin-general' ], Popup_Maker::$VER, true );
+		// @deprecated handle. Currently loads empty file and admin-general as dependency.
+		wp_register_script( 'popup-maker-admin', self::$js_url . 'admin-deprecated.js', [ 'pum-admin-general' ], Popup_Maker::$VER, true );
+
+		if ( PUM_Utils_Upgrades::instance()->has_uncomplete_upgrades() ) {
+			wp_enqueue_script( 'pum-admin-batch' );
+		}
+
+		if ( pum_is_all_popups_page() ) {
+			wp_enqueue_script( 'pum-admin-general' );
+		}
+
+		if ( pum_is_popup_editor() ) {
+			wp_enqueue_script( 'pum-admin-popup-editor' );
+		}
+
+		if ( pum_is_popup_theme_editor() ) {
+			wp_enqueue_script( 'pum-admin-theme-editor' );
+			wp_localize_script( 'pum-admin-theme-editor', 'pum_google_fonts', PUM_Integration_GoogleFonts::fetch_fonts() );
+		}
+
+		if ( pum_is_settings_page() ) {
+			wp_enqueue_script( 'pum-admin-settings-page' );
+			wp_localize_script(
+				'pum-admin-settings-page',
+				'pum_css_viewer',
+				[
+					'ajax_url' => admin_url( 'admin-ajax.php' ),
+					'nonce'    => wp_create_nonce( 'pum_get_css_styles' ),
+					'i18n'     => [
+						'loading'              => __( 'Loading Popup Maker CSS…', 'popup-maker' ),
+						'load_error'           => __( 'Popup Maker CSS could not be loaded. Please try again.', 'popup-maker' ),
+						'readable_unavailable' => __( 'Readable CSS is unavailable. Rebuild the plugin assets and try again.', 'popup-maker' ),
+						'show'                 => __( 'Show Popup Maker CSS', 'popup-maker' ),
+					],
+				]
+			);
+		}
+	}
+
+	/**
+	 * Build variables for the legacy admin script only when it is enqueued.
+	 *
+	 * @return array<string,mixed>
+	 */
+	private static function get_admin_vars() {
+		return apply_filters(
+			'pum_admin_vars',
+			apply_filters(
+				'pum_admin_var',
+				[
+					// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+					'post_id'             => ! empty( $_GET['post'] ) ? intval( $_GET['post'] ) : null,
+					'pm_dir_url'          => Popup_Maker::$URL,
+					'default_provider'    => pum_get_option( 'newsletter_default_provider', 'none' ),
+					'homeurl'             => home_url(),
+					'object_search_nonce' => wp_create_nonce( 'pum_ajax_object_search_nonce' ),
+					'rest_nonce'          => wp_create_nonce( 'wp_rest' ),
+					'I10n'                => [
+						'preview_popup'                   => __( 'Preview', 'popup-maker' ),
+						'add'                             => __( 'Add', 'popup-maker' ),
+						'save'                            => __( 'Save', 'popup-maker' ),
+						'update'                          => __( 'Update', 'popup-maker' ),
+						'insert'                          => __( 'Insert', 'popup-maker' ),
+						'cancel'                          => __( 'Cancel', 'popup-maker' ),
+						'confirm_delete_trigger'          => __( 'Are you sure you want to delete this trigger?', 'popup-maker' ),
+						'confirm_delete_cookie'           => __( 'Are you sure you want to delete this cookie?', 'popup-maker' ),
+						'no_cookie'                       => __( 'None', 'popup-maker' ),
+						'confirm_count_reset'             => __( 'Are you sure you want to reset the open count?', 'popup-maker' ),
+						'shortcode_ui_button_tooltip'     => __( 'Popup Maker Shortcodes', 'popup-maker' ),
+						'error_loading_shortcode_preview' => __( 'There was an error in generating the preview', 'popup-maker' ),
+					],
+				]
+			)
+		);
+	}
+
+	/**
+	 *
+	 */
+	public static function maybe_localize_and_templates() {
+		$admin_script_enqueued = self::script_is_enqueued( 'pum-admin-general' );
+		$style_only_compat     = ! $admin_script_enqueued && wp_style_is( 'pum-admin-general' );
+
+		if ( $style_only_compat ) {
+			wp_enqueue_script( 'pum-admin-general' );
+			wp_script_add_data( 'pum-admin-general', 'pum_style_only_compat', true );
+		}
+
+		if ( $admin_script_enqueued || $style_only_compat ) {
+			$localized_data   = wp_scripts()->get_data( 'pum-admin-general', 'data' );
+			$needs_admin_vars = ! self::has_localized_variable( $localized_data, 'pum_admin_vars' );
+			$needs_admin      = ! self::has_localized_variable( $localized_data, 'pum_admin' );
+
+			if ( $needs_admin_vars || $needs_admin ) {
+				$admin_vars = self::get_admin_vars();
+
+				if ( $needs_admin_vars ) {
+					wp_localize_script( 'pum-admin-general', 'pum_admin_vars', $admin_vars );
+				}
+
+				if ( $needs_admin ) {
+					wp_localize_script( 'pum-admin-general', 'pum_admin', $admin_vars );
+				}
+			}
+
+			// Style-only legacy consumers need globals, not the field templates.
+			$style_only_script = wp_scripts()->get_data( 'pum-admin-general', 'pum_style_only_compat' );
+			if ( $style_only_script && self::admin_general_has_queued_consumer() ) {
+				wp_script_add_data( 'pum-admin-general', 'pum_style_only_compat', false );
+				$style_only_script = false;
+			}
+
+			$templates_initialized = wp_scripts()->get_data( 'pum-admin-general', 'pum_templates_initialized' );
+
+			if ( ! $style_only_script && ! $templates_initialized ) {
+				// Register Templates.
+				PUM_Admin_Templates::init();
+				wp_script_add_data( 'pum-admin-general', 'pum_templates_initialized', true );
+			}
+		}
+
+		if ( self::script_is_enqueued( 'pum-admin-batch' ) ) {
+			$batch_data = wp_scripts()->get_data( 'pum-admin-batch', 'data' );
+
+			if ( ! self::has_localized_variable( $batch_data, 'pum_batch_vars' ) ) {
+				wp_localize_script(
+					'pum-admin-batch',
+					'pum_batch_vars',
+					[
+						'complete'              => __( 'You are all set, the upgrades completed successfully!', 'popup-maker' ),
+						'unsupported_browser'   => __( 'We are sorry but your browser is not compatible with this kind of file upload. Please upgrade your browser.', 'popup-maker' ),
+						'import_field_required' => 'This field must be mapped for the import to proceed.',
+					]
+				);
+			}
+		}
+	}
+
+	/**
+	 * Check for a complete wp_localize_script variable declaration.
+	 *
+	 * @param mixed  $data     Existing inline script data.
+	 * @param string $variable JavaScript variable name.
+	 *
+	 * @return bool
+	 */
+	private static function has_localized_variable( $data, $variable ) {
+		if ( ! is_string( $data ) || '' === $data ) {
+			return false;
+		}
+
+		$pattern = '/(?:^|[;\r\n])\s*var\s+' . preg_quote( $variable, '/' ) . '\s*=/m';
+
+		return 1 === preg_match( $pattern, $data );
+	}
+
+	/**
+	 * Check the queued dependency tree for a script handle.
+	 *
+	 * @param string $target Script handle.
+	 *
+	 * @return bool
+	 */
+	private static function script_is_enqueued( $target ) {
+		$wp_scripts = wp_scripts();
+		$pending    = $wp_scripts->queue;
+		$checked    = [];
+
+		while ( ! empty( $pending ) ) {
+			$handle = array_pop( $pending );
+
+			if ( $target === $handle ) {
+				return true;
+			}
+
+			if ( isset( $checked[ $handle ] ) ) {
+				continue;
+			}
+
+			$checked[ $handle ] = true;
+
+			if ( isset( $wp_scripts->registered[ $handle ] ) ) {
+				$pending = array_merge( $pending, $wp_scripts->registered[ $handle ]->deps );
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Check whether a queued script depends on the legacy general admin script.
+	 *
+	 * @return bool
+	 */
+	private static function admin_general_has_queued_consumer() {
+		$wp_scripts = wp_scripts();
+
+		foreach ( $wp_scripts->queue as $queued_handle ) {
+			if ( 'pum-admin-general' === $queued_handle ) {
+				continue;
+			}
+
+			$pending = [ $queued_handle ];
+			$checked = [];
+
+			while ( ! empty( $pending ) ) {
+				$handle = array_pop( $pending );
+
+				if ( isset( $checked[ $handle ] ) || ! isset( $wp_scripts->registered[ $handle ] ) ) {
+					continue;
+				}
+
+				$checked[ $handle ] = true;
+
+				foreach ( $wp_scripts->registered[ $handle ]->deps as $dependency ) {
+					if ( 'pum-admin-general' === $dependency ) {
+						return true;
+					}
+
+					$pending[] = $dependency;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * Load Admin Styles
+	 */
+	public static function register_admin_styles() {
+		$rtl = ( is_rtl() ? '-rtl' : '' );
+
+		wp_register_style( 'pum-admin-general', self::$css_url . 'admin-general' . $rtl . '.css', [ 'dashicons', 'wp-color-picker' ], Popup_Maker::$VER );
+		wp_register_style( 'pum-admin-batch', self::$css_url . 'admin-batch' . $rtl . '.css', [ 'pum-admin-general' ], Popup_Maker::$VER );
+		wp_register_style( 'pum-admin-popup-editor', self::$css_url . 'admin-popup-editor' . $rtl . '.css', [ 'pum-admin-general' ], Popup_Maker::$VER );
+		wp_register_style( 'pum-admin-theme-editor', self::$css_url . 'admin-theme-editor' . $rtl . '.css', [ 'pum-admin-general' ], Popup_Maker::$VER );
+		wp_register_style( 'pum-admin-extensions-page', self::$css_url . 'admin-extensions-page' . $rtl . '.css', [ 'pum-admin-general' ], Popup_Maker::$VER );
+		wp_register_style( 'pum-admin-settings-page', self::$css_url . 'admin-settings-page' . $rtl . '.css', [ 'pum-admin-general' ], Popup_Maker::$VER );
+		wp_register_style( 'pum-admin-support-page', self::$css_url . 'admin-support-page' . $rtl . '.css', [ 'pum-admin-general' ], Popup_Maker::$VER );
+		wp_register_style( 'pum-admin-shortcode-ui', self::$css_url . 'admin-shortcode-ui' . $rtl . '.css', [ 'pum-admin-general' ], Popup_Maker::$VER );
+
+		// @deprecated handle. Currently loads empty file and admin-general as dependency.
+		wp_register_style( 'popup-maker-admin', self::$css_url . 'admin-deprecated' . $rtl . '.css', [ 'pum-admin-general' ], Popup_Maker::$VER );
+
+		if ( PUM_Utils_Upgrades::instance()->has_uncomplete_upgrades() ) {
+			wp_enqueue_style( 'pum-admin-batch' );
+		}
+
+		if ( pum_is_popup_editor() ) {
+			wp_enqueue_style( 'pum-admin-popup-editor' );
+		}
+
+		if ( pum_is_popup_theme_editor() ) {
+			PUM_Site_Assets::register_styles();
+			wp_enqueue_style( 'pum-admin-theme-editor' );
+		}
+
+		if ( pum_is_extensions_page() && 'core' === apply_filters( 'pum_admin_extend_page_owner', 'core' ) ) {
+			wp_enqueue_style( 'pum-admin-extensions-page' );
+		}
+
+		if ( pum_is_settings_page() ) {
+			wp_enqueue_style( 'pum-admin-settings-page' );
+		}
+
+		if ( pum_is_support_page() ) {
+			wp_enqueue_style( 'pum-admin-support-page' );
+		}
+	}
+
+	/**
+	 * @return bool
+	 */
+	public static function should_load() {
+
+		if ( defined( 'PUM_FORCE_ADMIN_SCRIPTS_LOAD' ) && PUM_FORCE_ADMIN_SCRIPTS_LOAD ) {
+			return true;
+		}
+
+		if ( ! is_admin() ) {
+			return false;
+		}
+
+		return pum_is_admin_page();
+	}
+}

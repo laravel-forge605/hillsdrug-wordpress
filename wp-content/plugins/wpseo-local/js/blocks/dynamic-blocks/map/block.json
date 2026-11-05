@@ -1,0 +1,92 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/block.json",
+  "apiVersion": 3,
+  "version": "15.4",
+  "name": "yoast-seo-local/map",
+  "title":  "Yoast SEO: Local - Map",
+  "category": "yoast-seo-local",
+  "icon": "location-alt",
+  "keywords": [
+    "Address",
+    "Yoast",
+    "Local"
+  ],
+  "textdomain": "yoast-seo-local",
+  "attributes": {
+    "selectedLocation": {
+      "type": "number",
+      "default": -1
+    },
+    "showState": {
+      "type": "boolean",
+      "default": false
+    },
+    "showCountry": {
+      "type": "boolean",
+      "default": false
+    },
+    "showPhone": {
+      "type": "boolean",
+      "default": true
+    },
+    "showPhone2nd": {
+      "type": "boolean",
+      "default": true
+    },
+    "showFax": {
+      "type": "boolean",
+      "default": true
+    },
+    "showEmail": {
+      "type": "boolean",
+      "default": false
+    },
+    "showURL": {
+      "type": "boolean",
+      "default": false
+    },
+    "showRoute": {
+      "type": "boolean",
+      "default": false
+    },
+    "allowScrolling": {
+      "type": "boolean",
+      "default": true
+    },
+    "allowDragging": {
+      "type": "boolean",
+      "default": true
+    },
+    "markerClustering": {
+      "type": "boolean",
+      "default": false
+    },
+    "defaultShowInfoWindow": {
+      "type": "boolean",
+      "default": false
+    },
+    "mapType": {
+      "type": "string",
+      "default": "roadmap"
+    },
+    "zoomLevel": {
+      "type": "string",
+      "default": "-1"
+    },
+    "mapWidth": {
+      "type": "string",
+      "default": "400"
+    },
+    "mapHeight": {
+      "type": "string",
+      "default": "300"
+    },
+    "showCategoryFilter": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "example": {
+    "attributes": {}
+  }
+}

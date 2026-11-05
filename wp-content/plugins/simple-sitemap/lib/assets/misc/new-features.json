@@ -1,0 +1,192 @@
+[
+	{
+		"type": "new",
+		"license": "free",
+		"banner_url": "block-preview.png",
+		"version": "3.8.0",
+		"date": "1st September 2026",
+		"title": "More Ready-made Sitemap Starters",
+		"description": "<p style='margin:15px 0;'>Create private starter drafts for recent posts, summaries, combined content, grouped posts, child Pages, and other common sitemap layouts. Nothing is published automatically.</p>",
+		"learn_more_url": "https://wpgoplugins.com/documentation/simple-sitemap/"
+	},
+	{
+		"type": "new",
+		"license": "pro",
+		"banner_url": "optionally-exclude-child-pages.png",
+		"version": "3.8.0",
+		"date": "1st September 2026",
+		"title": "More Precise Content Directories",
+		"description": "<p style='margin:15px 0;'>Choose a specific term in Grouped Sitemap, apply different query and sorting rules to each tab, and optionally respect SEO noindex and current-language rules.</p>",
+		"learn_more_url": "https://wpgoplugins.com/documentation/simple-sitemap/reference/"
+	},
+	{
+		"type": "new",
+		"license": "pro",
+		"banner_url": "block-preview.png",
+		"version": "3.8.0",
+		"date": "1st September 2026",
+		"title": "WooCommerce Product Directories",
+		"description": "<p style='margin:15px 0;'>Build product sitemaps by category, sale status, stock status, or featured status, with optional images, prices, descriptions, SKUs, and stock labels.</p>",
+		"learn_more_url": "https://demo.wpgoplugins.com/simple-sitemap/#woocommerce-products-block"
+	},
+	{
+		"type": "fix",
+		"license": "pro",
+		"banner_url": "optionally-exclude-child-pages.png",
+		"version": "3.8.0",
+		"date": "1st September 2026",
+		"title": "Consistent Child Page Thumbnails",
+		"description": "<p style='margin:15px 0;'>Child Pages thumbnails now use exact square frames without stretching, including older non-square images and themes with broad featured-image styles.</p>",
+		"learn_more_url": "https://demo.wpgoplugins.com/simple-sitemap/#child-pages-shortcode"
+	},
+	{
+		"type": "new",
+		"license": "free",
+		"banner_url": "block-preview.png",
+		"version": "3.7.0",
+		"date": "21st August 2026",
+		"title": "Consistent Sitemap Spacing",
+		"description": "<p style='margin:15px 0;'>Set Compact, Comfortable, or Custom item and nested-level spacing globally, then override it for an individual block or shortcode when needed. Child Pages can also show its linked parent as the root.</p>",
+		"learn_more_url": "https://wpgoplugins.com/documentation/simple-sitemap/reference/"
+	},
+	{
+		"type": "new",
+		"license": "pro",
+		"banner_url": "optionally-exclude-child-pages.png",
+		"version": "3.7.0",
+		"date": "21st August 2026",
+		"title": "Clearer Child Page Sitemaps",
+		"description": "<p style='margin:15px 0;'>Add optional separator lines and compact featured-image thumbnails to licensed Child Pages sitemaps, including the established <code>[simple-sitemap-child]</code> workflow.</p>",
+		"learn_more_url": "https://demo.wpgoplugins.com/simple-sitemap/#child-pages-shortcode"
+	},
+	{
+		"type": "new",
+		"license": "free",
+		"banner_url": "block-preview.png",
+		"version": "3.6.3",
+		"date": "20th August 2026",
+		"title": "A New Simple Sitemap Home",
+		"description": "<p style='margin:15px 0;'>Create a sitemap draft, follow the visual Quick Start, explore Free actions, jump to matching live examples, and share feedback from one focused dashboard.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "update",
+		"license": "pro",
+		"banner_url": "optionally-exclude-child-pages.png",
+		"version": "3.6.3",
+		"date": "20th August 2026",
+		"title": "Explore the Complete Pro Toolkit",
+		"description": "<p style='margin:15px 0;'>Licensed installs now show one comprehensive feature explorer with Pro-appropriate support, documentation, changelog, and direct live-example links.</p>",
+		"learn_more_url": "https://demo.wpgoplugins.com/simple-sitemap/"
+	},
+	{
+		"type": "new",
+		"license": "free",
+		"banner_url": "optionally-exclude-child-pages.png",
+		"version": "3.6.2",
+		"date": "11th August 2026",
+		"title": "Include and Exclude Filters in Free",
+		"description": "<p style='margin:15px 0;'>Choose exact post or page IDs to include, or leave individual items out, directly from the Simple Sitemap block or shortcode.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "new",
+		"license": "free",
+		"banner_url": "block-preview.png",
+		"version": "3.6.2",
+		"date": "11th August 2026",
+		"title": "Quick Start and Starter Patterns",
+		"description": "<p style='margin:15px 0;'>Create a sitemap page from three ready-made patterns, with clearer setup guidance and transparent Free and Pro feature descriptions.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "new",
+		"license": "pro",
+		"banner_url": "optionally-exclude-child-pages.png",
+		"version": "3.6.2",
+		"date": "11th August 2026",
+		"title": "WooCommerce Product Sitemaps",
+		"description": "<p style='margin:15px 0;'>Create bounded product lists or category-grouped product sitemaps with stock, featured-product, price, SKU, excerpt, and image controls.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "update",
+		"license": "free",
+		"banner_url": "block-preview.png",
+		"version": "3.6.2",
+		"date": "11th August 2026",
+		"title": "Modern WordPress Compatibility",
+		"description": "<p style='margin:15px 0;'>Simple Sitemap now uses Block API v3 for the current iframed WordPress editor, with improved accessibility, safer output, and more reliable controls.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "update",
+		"license": "pro",
+		"banner_url": "optionally-exclude-child-pages.png",
+		"version": "3.6.2",
+		"date": "11th August 2026",
+		"title": "More Sitemap Formats with Pro",
+		"description": "<p style='margin:15px 0;'>Build taxonomy, navigation menu, archive, product, and hierarchical child-content sitemaps, with per-section, SEO, language, layout, and filtering controls.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "update",
+		"license": "free",
+		"banner_url": "custom-post-type-labels.png",
+		"version": "3.5.7",
+		"date": "1st January 2023",
+		"title": "Custom Post Type Labels",
+		"description": "<p style='margin:15px 0;'>You can now edit the title labels for a post type via the sitemap block settings.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "new",
+		"license": "pro",
+		"banner_url": "optionally-exclude-child-pages.png",
+		"version": "3.5.7",
+		"date": "1st January 2023",
+		"title": "Exclude Child Pages",
+		"description": "<p style='margin:15px 0;'>Use the new <code>exclude_child</code> shortcode attribute to optionally exclude the child pages of a specific page, that has been excluded from the sitemap.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "update",
+		"license": "pro",
+		"banner_url": "new-default-attribute-settings.png",
+		"version": "3.5.7",
+		"date": "22nd November 2021",
+		"title": "New Default Settings",
+		"description": "<p style='margin:15px 0;'>The <code>post_type_label_font_size</code> and <code>sitemap_container_margin</code> attributes in the sitemap blocks/shortcodes are now set to empty strings by default to blend in better with the current active WordPress theme.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "new",
+		"license": "free",
+		"banner_url": "new-sort-options.png",
+		"version": "3.5.7",
+		"date": "22nd November 2021",
+		"title": "New Sort Options",
+		"description": "<p style='margin:15px 0;'>New sort options (<em>Random Order, Menu Order, Comment Count</em>) have been added to the <strong>Orderby</strong> attribute for the main sitemap block and shortcode.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "new",
+		"license": "free",
+		"banner_url": "num-terms-attribute.png",
+		"version": "3.5.7",
+		"date": "22nd November 2021",
+		"title": "New Shortcode Attribute",
+		"description": "<p style='margin:15px 0;'>Added a new <strong><code>num_terms</code></strong> attribute to the <code>&#91;simple-sitemap-group&#93;</code> shortcode to limit the number of taxonomy terms displayed.</p>",
+		"learn_more_url": ""
+	},
+	{
+		"type": "new",
+		"license": "free",
+		"banner_url": "block-preview.png",
+		"version": "3.5.7",
+		"date": "22nd November 2021",
+		"title": "Preview Sitemap Blocks",
+		"description": "<p style='margin:15px 0;'>Added support for block previews in the editor for sitemap and sitemap group blocks, when browsing blocks.</p>",
+		"learn_more_url": ""
+	}
+]

@@ -1,0 +1,93 @@
+<?php
+/**
+ * File that is run during plugin uninstall (not just de-activate).
+ */
+
+// If uninstall not called from WordPress exit.
+if ( ! defined( 'WP_UNINSTALL_PLUGIN' ) ) {
+	exit();
+}
+
+/**
+ * Remove all Simple History data for the current site:
+ * options, database tables, and scheduled cron events.
+ */
+function simple_history_cleanup_site() {
+	global $wpdb;
+
+	// Remove options.
+	$arr_options = array(
+		'simple_history_db_version',
+		'simple_history_pager_size',
+		'simple_history_pager_size_dashboard',
+		'simple_history_rss_secret',
+		'simple_history_enable_rss_feed',
+		'simple_history_show_on_dashboard',
+		'simple_history_show_as_page',
+		'simple_history_show_in_admin_bar',
+		'simple_history_detective_mode_enabled',
+		'simple_history_experimental_features_enabled',
+		'simple_history_install_date_gmt',
+		'simple_history_welcome_message_seen',
+		'simple_history_auto_backfill_pending',
+		'simple_history_auto_backfill_status',
+		'simple_history_manual_backfill_status',
+		'simple_history_core_files_integrity_results',
+		'simple_history_total_logged_events_count',
+		'simple_history_email_report_enabled',
+		'simple_history_email_report_recipients',
+		'simple_history_email_report_include_admin',
+		'simple_history_mail_failures',
+		'simple_history_mail_failure_window',
+		'simple_history_channel_file',
+		'simple_history_retention_days',
+		'sh_core_failed_login_count',
+		'sh_core_failed_login_total_suppressed',
+	);
+
+	foreach ( $arr_options as $one_option ) {
+		delete_option( $one_option );
+	}
+
+	// Per-user dismissal of the failed email notice.
+	delete_metadata( 'user', 0, 'simple_history_mail_failures_dismissed', '', true );
+
+	// Remove database tables.
+	$table_name = $wpdb->prefix . 'simple_history';
+	// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange
+	$wpdb->query( "DROP TABLE IF EXISTS $table_name" );
+
+	$table_name = $wpdb->prefix . 'simple_history_contexts';
+	// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange
+	$wpdb->query( "DROP TABLE IF EXISTS $table_name" );
+
+	// Remove all scheduled cron events.
+	$cron_hooks = array(
+		'simple_history/email_report',
+		'simple_history/maybe_purge_db',
+		'simple_history/core_files_integrity_check',
+		'simple_history_cleanup_log_files',
+		'simple_history/mail_failure_logger/write_summary',
+	);
+
+	foreach ( $cron_hooks as $hook ) {
+		wp_unschedule_hook( $hook );
+	}
+}
+
+if ( is_multisite() ) {
+	$site_ids = get_sites(
+		array(
+			'fields' => 'ids',
+			'number' => 0,
+		) 
+	);
+
+	foreach ( $site_ids as $site_id ) {
+		switch_to_blog( $site_id ); // phpcs:ignore WordPressVIPMinimum.Functions.RestrictedFunctions.switch_to_blog_switch_to_blog
+		simple_history_cleanup_site();
+		restore_current_blog();
+	}
+} else {
+	simple_history_cleanup_site();
+}
