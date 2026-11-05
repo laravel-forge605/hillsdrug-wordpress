@@ -14,7 +14,21 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'HD_PC_DIR', WP_CONTENT_DIR . '/cache/hd-pagecache/' );
+function hd_pc_dir() {
+	static $d = null;
+	if ( null !== $d ) {
+		return $d;
+	}
+	foreach ( array( WP_CONTENT_DIR . '/cache/hd-pagecache/', WP_CONTENT_DIR . '/uploads/hd-pagecache/' ) as $try ) {
+		if ( ! is_dir( $try ) ) {
+			@mkdir( $try, 0755, true );
+		}
+		if ( is_dir( $try ) && is_writable( $try ) ) {
+			return $d = $try;
+		}
+	}
+	return $d = '';
+}
 define( 'HD_PC_TTL', 6 * HOUR_IN_SECONDS );
 
 /** Can this request be served from / stored in the cache? */
@@ -66,11 +80,11 @@ function hd_pc_cacheable() {
 function hd_pc_file() {
 	$path = (string) parse_url( $_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH );
 	$path = '/' . trim( $path, '/' );
-	return HD_PC_DIR . md5( strtolower( ( $_SERVER['HTTP_HOST'] ?? '' ) . $path ) ) . '.html';
+	return hd_pc_dir() . md5( strtolower( ( $_SERVER['HTTP_HOST'] ?? '' ) . $path ) ) . '.html';
 }
 
 function hd_pc_purge_all() {
-	foreach ( glob( HD_PC_DIR . '*.html' ) ?: array() as $f ) {
+	foreach ( glob( hd_pc_dir() . '*.html' ) ?: array() as $f ) {
 		@unlink( $f );
 	}
 }
@@ -95,19 +109,25 @@ add_action( 'template_redirect', function () {
 	if ( function_exists( 'is_checkout' ) || function_exists( 'is_cart' ) ) {
 		return; // never cache shop pages if WooCommerce ever appears
 	}
-	header( 'X-HD-Cache: MISS' );
 	ob_start( function ( $html ) {
+		$why = 'stored';
+		$dir = hd_pc_dir();
 		if ( 200 !== http_response_code() || strlen( $html ) < 1500 || false === stripos( $html, '</html>' ) ) {
-			return $html;
-		}
-		if ( ! is_dir( HD_PC_DIR ) ) {
-			@wp_mkdir_p( HD_PC_DIR );
-		}
-		if ( is_dir( HD_PC_DIR ) && is_writable( HD_PC_DIR ) ) {
-			$tmp = HD_PC_DIR . uniqid( 'tmp', true );
-			if ( false !== @file_put_contents( $tmp, $html . "\n<!-- cached " . gmdate( 'Y-m-d H:i:s' ) . " UTC by hd-pagecache -->" ) ) {
-				@rename( $tmp, hd_pc_file() );
+			$why = 'not-cacheable-response';
+		} elseif ( '' === $dir ) {
+			$why = 'no-writable-dir';
+		} else {
+			$tmp = $dir . uniqid( 'tmp', true );
+			if ( false === @file_put_contents( $tmp, $html . "\n<!-- cached " . gmdate( 'Y-m-d H:i:s' ) . " UTC by hd-pagecache -->" ) ) {
+				$why = 'write-failed';
+			} elseif ( ! @rename( $tmp, hd_pc_file() ) ) {
+				@unlink( $tmp );
+				$why = 'rename-failed';
 			}
+		}
+		if ( ! headers_sent() ) {
+			header( 'X-HD-Cache: MISS (' . $why . ')' );
+			header( 'X-HD-Gen-Ms: ' . round( ( microtime( true ) - $_SERVER['REQUEST_TIME_FLOAT'] ) * 1000 ) );
 		}
 		return $html;
 	} );
