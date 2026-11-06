@@ -47,9 +47,7 @@ function hd_speed_async_css_handles() {
 		'wpcf7-redirect-script-frontend',
 		'wp-show-posts',
 		'wpshowposts',
-		'elementor-gf-local-roboto',
 		'elementor-gf-local-robotoslab',
-		'elementor-gf-local-montserrat',
 		'widget-nested-accordion',
 		'widget-divider',
 		'widget-icon-box',
@@ -128,7 +126,7 @@ add_filter( 'style_loader_tag', function ( $tag, $handle ) {
 
 /* Duplicate (older) icon/font CSS from Header Footer Elementor; Elementor core already loads newer copies. */
 add_filter( 'style_loader_tag', function ( $tag, $handle ) {
-	static $dupes = array( 'hfe-elementor-icons', 'hfe-icons-list', 'hfe-social-icons', 'hfe-social-share-icons-brands', 'hfe-social-share-icons-fontawesome', 'hfe-nav-menu-icons' );
+	static $dupes = array( 'hfe-elementor-icons', 'hfe-icons-list', 'hfe-social-icons', 'hfe-social-share-icons-brands', 'hfe-social-share-icons-fontawesome', 'hfe-nav-menu-icons', 'elementor-gf-local-roboto', 'elementor-gf-local-montserrat' );
 	return ( hd_speed_active() && in_array( $handle, $dupes, true ) ) ? '' : $tag;
 }, 10, 2 );
 
@@ -143,9 +141,40 @@ add_action( 'wp_head', function () {
 		. '@font-face{font-family:"Font Awesome 5 Free";font-style:normal;font-weight:400;font-display:swap;src:url(' . $b . '/font-awesome/webfonts/fa-regular-400.woff2) format("woff2")}'
 		. '@font-face{font-family:"Font Awesome 5 Brands";font-style:normal;font-weight:400;font-display:swap;src:url(' . $b . '/font-awesome/webfonts/fa-brands-400.woff2) format("woff2")}'
 		. '@font-face{font-family:eicons;font-display:swap;src:url(' . $b . '/eicons/fonts/eicons.woff2) format("woff2")}'
+		. hd_speed_text_fonts_css()
 		. '</style>' . "
 ";
 }, 50 );
+
+/* Roboto (body) + Montserrat (header): one variable latin file each. Inline faces + preload replace
+ * Elementor's 2 big local font CSS files (~150 @font-face rules) so text paints in the right font
+ * immediately and doesn't reflow (fixes the layout shift). */
+function hd_speed_text_fonts() {
+	return array(
+		'Roboto'     => '/uploads/elementor/google-fonts/fonts/roboto-kfo7cnqeu92fr1me7ksn66agldtyluama3yuba.woff2',
+		'Montserrat' => '/uploads/elementor/google-fonts/fonts/montserrat-jtusjig1_i6t8kchkm459wrhyzbi.woff2',
+	);
+}
+function hd_speed_text_fonts_css() {
+	$css = '';
+	foreach ( hd_speed_text_fonts() as $family => $rel ) {
+		if ( ! file_exists( WP_CONTENT_DIR . $rel ) ) {
+			continue;
+		}
+		$css .= '@font-face{font-family:"' . $family . '";font-style:normal;font-weight:100 900;font-display:swap;src:url(' . content_url( $rel ) . ') format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}';
+	}
+	return $css;
+}
+add_action( 'wp_head', function () {
+	if ( ! hd_speed_active() ) {
+		return;
+	}
+	foreach ( hd_speed_text_fonts() as $rel ) {
+		if ( file_exists( WP_CONTENT_DIR . $rel ) ) {
+			echo '<link rel="preload" as="font" type="font/woff2" href="' . esc_url( content_url( $rel ) ) . '" crossorigin>' . "\n";
+		}
+	}
+}, 2 );
 
 /* Drop the emoji stylesheet. */
 add_action( 'wp_enqueue_scripts', function () {

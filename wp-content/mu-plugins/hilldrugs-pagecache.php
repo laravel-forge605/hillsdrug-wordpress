@@ -19,7 +19,11 @@ function hd_pc_dir() {
 	if ( null !== $d ) {
 		return $d;
 	}
-	foreach ( array( WP_CONTENT_DIR . '/cache/hd-pagecache/', WP_CONTENT_DIR . '/uploads/hd-pagecache/' ) as $try ) {
+	foreach ( array(
+		WP_CONTENT_DIR . '/cache/hd-pagecache/',
+		WP_CONTENT_DIR . '/uploads/hd-pagecache/',
+		rtrim( sys_get_temp_dir(), '/\\' ) . '/hd-pagecache-' . md5( ABSPATH ) . '/', // system temp: always writable by PHP
+	) as $try ) {
 		if ( ! is_dir( $try ) ) {
 			@mkdir( $try, 0755, true );
 		}

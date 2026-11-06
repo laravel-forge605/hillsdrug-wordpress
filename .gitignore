@@ -24,3 +24,5 @@ error_log
 # Temporary files
 .DS_Store
 Thumbs.db
+.env
+wp-content/mu-plugins/zz-local-dev.php
